@@ -141,14 +141,17 @@ def recent_records(openid: str, limit: int = 5) -> list:
     return [dict(r) for r in rows]
 
 
-def delete_record_by_match(openid: str, tx_date: str, kind: str, amount: float,
+def delete_record_by_match(openid: str, tx_date: str, kind: str, amount,
                            note: str = None):
-    """按日期+分类(或细分类)+金额删除一条账目; note 非空时再按备注精确匹配
+    """按日期+分类(或细分类)+金额删除一条账目; amount 为 None 时不限金额
+    note 非空时再按备注精确匹配
     多个匹配时删除最早的一笔; 返回(被删记录dict, 剩余相同记录数); 无匹配返回(None, 0)"""
     with _lock, _conn() as conn:
-        where = ("openid=? AND tx_date=? AND "
-                 "(category=? OR subcategory=?) AND ABS(amount-?)<0.005")
-        args = [openid, tx_date, kind, kind, amount]
+        where = "openid=? AND tx_date=? AND (category=? OR subcategory=?)"
+        args = [openid, tx_date, kind, kind]
+        if amount is not None:
+            where += " AND ABS(amount-?)<0.005"
+            args.append(amount)
         if note:
             where += " AND note=?"
             args.append(note)

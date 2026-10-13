@@ -12,6 +12,7 @@ from config import (WECHAT_TOKEN, ALLOWED_OPENIDS, PUSH_TOKEN,
                     RUN_SCHEDULER, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY)
 import wechat
 import db
+import agent
 from llm_parser import (parse_record, ai_report, parse_batch,
                         tokenize_amounts, annual_report, ai_summary)
 from report import (build_daily_report, build_weekly_report,
@@ -41,6 +42,8 @@ HELP = ("📌 记账详细命令:\n"
         "    「午饭35」「打车花20」「发工资12000」\n"
         "    「昨天买书58」「补记2026年9月5日吃饭30」\n"
         "    「奶茶6 洗澡2 喝水3」——一次记多笔\n"
+        "  不用记命令也行, AI能听懂, 例如:\n"
+        "    「帮我把昨天的奶茶删掉」「上周花了多少」\n"
         "🔎 查账:\n"
         "  最近——查看最近5条记录\n"
         "  本月——查看本月记录情况\n"
@@ -199,10 +202,249 @@ def _build_plain_analysis(label: str, plabel: str, data: dict) -> str:
     return "".join(parts)
 
 
-def handle_record(openid: str, text: str, source: str, day: str = "") -> str:
+# ==================== AI Agent 工具处理器 ====================
+# agent.route 返回的工具名 -> 执行函数: 由LLM决定意图与参数, 这里只做校验执行
+# 校验不过抛异常 -> 调用方转正则兜底; 查询/删除类查不到时直接返回提示文本
+
+def _norm_date(s, default=None):
+    """严格校验 YYYY-MM-DD, 非法日期抛错(触发正则兜底)"""
+    if not s:
+        return default
+    try:
+        datetime.strptime(str(s), "%Y-%m-%d")
+        return str(s)
+    except ValueError:
+        raise ValueError(f"非法日期: {s}")
+
+
+def _agent_amount(v):
+    """校验金额: 数字且>0, 返回两位小数; 其余抛错"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise ValueError(f"金额无效: {v!r}")
+    return round(float(v), 2)
+
+
+def _income_cat(cat: str) -> bool:
+    return any(k in cat for k in ("工资", "到账", "收入", "进账", "收到红包", "退款"))
+
+
+def _agent_record(openid: str, args: dict, source: str, text: str = "") -> str:
+    day = _norm_date(args.get("date"), datetime.now().strftime("%Y-%m-%d")) \
+        or datetime.now().strftime("%Y-%m-%d")
+    items = args.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("无有效账目条目")
+    rows = []
+    for it in items[:20]:
+        if not isinstance(it, dict):
+            raise ValueError("条目格式错误")
+        cat = str(it.get("category") or "").strip()[:20]
+        if not cat:
+            raise ValueError("类别为空")
+        amt = _agent_amount(it.get("amount"))
+        rtype = it.get("type") if it.get("type") in ("支出", "收入") else \
+            ("收入" if _income_cat(cat) else "支出")
+        note = str(it.get("note") or cat)[:20]
+        rows.append((rtype, cat, amt, note))
+    for rtype, cat, amt, note in rows:
+        db.add_record(openid, day, rtype, cat, amt, note, source, cat)
+    if len(rows) == 1:
+        rtype, cat, amt, note = rows[0]
+        icon = "💸" if rtype == "支出" else "💰"
+        return (f"{icon} 已记账 {day}\n{cat} ¥{amt:.2f} | {note}\n"
+                f"发送【今日】查看汇总")
+    total = round(sum(a for _, _, a, _ in rows), 2)
+    lines = [f"  {c} ¥{a:.2f}" for _, c, a, _ in rows]
+    return (f"💸 已记账 {day} 共{len(rows)}笔, 合计 ¥{total:.2f}:\n"
+            + "\n".join(lines))
+
+
+def _agent_delete(openid: str, args: dict, source: str, text: str = "") -> str:
+    day = _norm_date(args.get("date"), datetime.now().strftime("%Y-%m-%d"))
+    items = args.get("items")
+    pairs = []
+    if isinstance(items, list):
+        for it in items[:20]:
+            if not isinstance(it, dict):
+                raise ValueError("条目格式错误")
+            cat = str(it.get("category") or "").strip()[:20]
+            if not cat:
+                raise ValueError("类别为空")
+            amt = it.get("amount")
+            amt = None if amt is None else _agent_amount(amt)
+            pairs.append((cat, amt))
+    if not pairs:
+        raise ValueError("无删除条目")
+    if len(pairs) == 1:
+        kind, amount = pairs[0]
+        rec, more = db.delete_record_by_match(openid, day, kind, amount)
+        if rec is None:
+            amt_s = f" ¥{amount:.2f}" if amount is not None else ""
+            return (f"❌ 没有找到匹配记录: {day} {kind}{amt_s}\n"
+                    f"可先发【查{day}】核对该天的账目")
+        reply = (f"🗑 已删除 {rec['tx_date']} {rec['category']} "
+                 f"¥{rec['amount']:.2f} {rec['note']}")
+        if more:
+            reply += f"\n⚠️ 还有{more}条相同记录, 再次发送本命令可继续删除"
+        return reply
+    deleted, missing = [], []
+    for kind, amount in pairs:
+        rec, _ = db.delete_record_by_match(openid, day, kind, amount, kind)
+        (deleted if rec is not None else missing).append(f"  {kind} ¥{amount:.2f}")
+    reply = f"🗑 已删除 {day} {len(deleted)}笔:\n" + "\n".join(deleted)
+    if missing:
+        reply += "\n❌ 未找到:\n" + "\n".join(missing)
+    return reply
+
+
+def _agent_modify(openid: str, args: dict, source: str, text: str = "") -> str:
+    old_day = _norm_date(args.get("date"))
+    if not old_day:
+        raise ValueError("缺少原记录日期")
+    old_cat = str(args.get("old_category") or "").strip()[:20]
+    new_cat = str(args.get("new_category") or "").strip()[:20]
+    if not old_cat or not new_cat:
+        raise ValueError("缺少修改前后的类别")
+    try:
+        old_amt = _agent_amount(args.get("old_amount"))
+    except ValueError:
+        old_amt = None                        # 用户没说原金额: 按日期+类别定位
+    new_amt = _agent_amount(args.get("new_amount"))
+    # 用户没说"改到某天"就忽略模型给的新日期(防止幻觉挪账); 只在原文有改日期意图时才用
+    if any(k in text for k in ("改到", "挪到", "移到", "记到", "换到")):
+        new_day = _norm_date(args.get("new_date"), old_day) or old_day
+    else:
+        new_day = old_day
+    rec, more = db.delete_record_by_match(openid, old_day, old_cat, old_amt)
+    if rec is None and old_amt is not None:
+        # 原金额不匹配(多为模型猜测): 按日期+类别兜底定位
+        rec, more = db.delete_record_by_match(openid, old_day, old_cat, None)
+    if rec is None:
+        amt_s = f" ¥{old_amt:.2f}" if old_amt is not None else ""
+        return (f"❌ 没有找到匹配记录: {old_day} {old_cat}{amt_s}\n"
+                f"可先发【查{old_day}】/【最近】核对账目")
+    rtype = "收入" if _income_cat(new_cat) else "支出"
+    db.add_record(openid, new_day, rtype, new_cat, new_amt, new_cat, source, new_cat)
+    reply = (f"✏️ 已修改 {old_day} {old_cat} ¥{rec['amount']:.2f} → "
+             f"{new_day} {new_cat} ¥{new_amt:.2f}")
+    if more:
+        reply += f"\n⚠️ 还有{more}条相同旧账, 未被删除"
+    return reply
+
+
+# 周期别名: 8B模型偶尔输出 last_week 等英文周期, 统一归一化
+_PERIOD_ALIAS = {"last_week": "上周", "this_week": "本周", "week": "本周",
+                 "last_month": "上月", "this_month": "本月", "month": "本月",
+                 "year": "今年", "this_year": "今年", "last_year": "去年"}
+
+
+def _norm_period(p) -> str:
+    """只做确定性的归一化: 精确值/别名映射; 垃圾值原样返回, 交给原文回扫"""
+    raw = str(p or "").strip()
+    if raw in ("本月", "上月", "本周", "上周", "今年", "去年"):
+        return raw
+    return _PERIOD_ALIAS.get(raw.lower(), raw)
+
+
+def _period_from_text(text: str) -> str:
+    """模型输出的周期异常时, 回扫用户原文推导周期"""
+    for kw, val in (("本周", "本周"), ("这周", "本周"), ("上周", "上周"),
+                    ("本月", "本月"), ("这个月", "本月"), ("上月", "上月"),
+                    ("今年", "今年"), ("去年", "去年")):
+        if kw in text:
+            return val
+    return _norm_period(text) if text else ""
+
+
+def _agent_query(openid: str, args: dict, source: str, text: str = "") -> str:
+    period = _norm_period(args.get("period") or "today")
+    if period not in ("today", "yesterday", "this_month", "recent", "date",
+                      "本周", "上周", "今年", "去年"):
+        period = _period_from_text(text) or period
+    now = datetime.now()
+    if period in ("本周", "上周"):
+        base = now - timedelta(weeks=1) if period == "上周" else now
+        start = base - timedelta(days=base.weekday())
+        end = start + timedelta(days=6)
+        s, e = start.date().isoformat(), end.date().isoformat()
+        t = db.week_stats(openid, s, e)
+        cats = db.week_by_category(openid, s, e)
+        top = "、".join(f"{c} ¥{v}" for c, v in cats[:3]) if cats else "暂无"
+        return (f"📅 {period}({s[5:]}~{e[5:]})支出: ¥{t['支出']:.2f}\n"
+                f"📅 收入: ¥{t['收入']:.2f}\n分类支出: {top}")
+    if period in ("今年", "去年"):
+        year = now.year if period == "今年" else now.year - 1
+        t = db.year_stats(openid, str(year))
+        cats = db.year_by_category(openid, str(year))
+        top = "、".join(f"{c} ¥{v}" for c, v in cats[:3]) if cats else "暂无"
+        return (f"📅 {year}年支出: ¥{t['支出']:.2f}\n"
+                f"📅 收入: ¥{t['收入']:.2f}\n分类支出: {top}")
+    if period == "today":
+        t = db.today_stats(openid, now.strftime("%Y-%m-%d"))
+        return f"📊 今日支出: ¥{t['支出']:.2f}\n📊 今日收入: ¥{t['收入']:.2f}"
+    if period == "yesterday":
+        y = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        t = db.today_stats(openid, y)
+        return f"📊 昨日({y})支出: ¥{t['支出']:.2f}\n📊 昨日收入: ¥{t['收入']:.2f}"
+    if period == "this_month":
+        month = now.strftime("%Y-%m")
+        m = db.month_stats(openid, month)
+        cats = db.month_by_category(openid, month)
+        top = "、".join(f"{c} ¥{v}" for c, v in cats[:5]) if cats else "暂无"
+        return (f"📅 本月支出: ¥{m['支出']:.2f}\n📅 本月收入: ¥{m['收入']:.2f}\n"
+                f"分类支出: {top}")
+    if period == "recent":
+        rows = db.recent_records(openid)
+        if not rows:
+            return "📭 还没有任何记账记录"
+        lines = [f"{r['tx_date']} {_cat_disp(r)} ¥{r['amount']:.2f} "
+                 f"{r['note']} [{r['type']}]" for r in rows]
+        return "📋 最近5笔:\n" + "\n".join(lines)
+    if period == "date":
+        day = _norm_date(args.get("date"))
+        if not day:
+            raise ValueError("缺少查询日期")
+        rows = db.day_records(openid, day)
+        if not rows:
+            return f"📭 {day} 没有账目记录"
+        total = sum(r["amount"] for r in rows)
+        lines = [f"{r['type']} {_cat_disp(r)} ¥{r['amount']:.2f} {r['note']}"
+                 for r in rows]
+        return (f"📅 {day} 共{len(rows)}笔, 合计 ¥{total:.2f}:\n"
+                + "\n".join(lines)
+                + f"\n删除某条: 删除{day} 分类 金额")
+    raise ValueError(f"未知查询周期: {period}")
+
+
+def _agent_analyze(openid: str, args: dict, source: str, text: str = "") -> str:
+    """Agent路径的分析: 用本地统计文字分析(不再二次调LLM, 保证5秒窗口)"""
+    period = _norm_period(args.get("period") or "本月")
+    if period not in ("本月", "上月", "本周", "上周", "今年", "去年"):
+        period = _period_from_text(text) or period
+    if period not in ("本月", "上月", "本周", "上周", "今年", "去年"):
+        raise ValueError(f"未知分析周期: {period}")
+    label, plabel, data = _analysis_data(openid, period)
+    if not data["expense"] and not data["income"]:
+        return f"📭 {plabel}({label}) 暂无收支记录, 记账后再来分析~"
+    plain = _build_plain_analysis(label, plabel, data)
+    return f"🤖 账单分析 {plabel}({label})\n{plain}"
+
+
+AGENT_HANDLERS = {
+    "record": _agent_record,
+    "delete": _agent_delete,
+    "modify": _agent_modify,
+    "query": _agent_query,
+    "analyze": _agent_analyze,
+}
+
+
+def handle_record(openid: str, text: str, source: str, day: str = "",
+                  use_llm: bool = True) -> str:
     """同步解析并入库, 返回确认文本(作为被动回复, 未认证订阅号无客服消息接口)
-    day 非空时覆盖解析出的日期(供补记/修改指定日期使用)"""
-    r = parse_record(text)
+    day 非空时覆盖解析出的日期(供补记/修改指定日期使用)
+    use_llm=False 时跳过大模型解析只用正则(Agent层已调过LLM时, 避免超5秒)"""
+    r = parse_record(text, use_llm=use_llm)
     sub = r.get("subcategory", "")
     tx_date = day or r["date"]
     db.add_record(openid, tx_date, r["type"], r["category"],
@@ -510,22 +752,78 @@ def wechat_callback():
     if text in ("帮助", "help", "指令"):
         return wechat.to_text_reply(msg.get("ToUserName", ""), openid, HELP)
 
-    # 批量记账: "奶茶6 洗澡2 喝水3" -> 一次记入多笔, 名称自动分类入库
-    batch = parse_batch(text)
-    if batch:
-        tx_date = datetime.now().strftime("%Y-%m-%d")
-        lines, total = [], 0.0
-        for note, amt, cat in batch:
-            db.add_record(openid, tx_date, "支出", cat, amt, note, source, note)
-            total += amt
-            lines.append(f"  {cat}·{note} ¥{amt:.2f}")
+    # ===== 清晰"名称金额"格式先走正则秒记: 不耗LLM额度/不依赖网络 =====
+    # 开头"今天/昨天"就地换算日期; 含改账/删除意图或"帮我记"类前缀的交给Agent理解
+    _FAST_SKIP = ("改成", "改为", "换成", "替换为", "变更为", "→", "->", "=>",
+                  "帮我", "请帮", "记一下", "记一笔", "删除", "删掉")
+    fast_date, fast_body = None, text
+    if fast_body.startswith("昨天"):
+        fast_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        fast_body = fast_body[2:].strip()
+    elif fast_body.startswith("今天"):
+        fast_date = datetime.now().strftime("%Y-%m-%d")
+        fast_body = fast_body[2:].strip()
+    if tokenize_amounts(fast_body) and not any(k in fast_body for k in _FAST_SKIP):
+        batch = parse_batch(fast_body)
+        if batch:                                # ≥2笔: 批量秒记
+            tx_date = fast_date or datetime.now().strftime("%Y-%m-%d")
+            lines, total = [], 0.0
+            for note, amt, cat in batch:
+                db.add_record(openid, tx_date, "支出", cat, amt, note, source, note)
+                total += amt
+                lines.append(f"  {cat}·{note} ¥{amt:.2f}")
+            return wechat.to_text_reply(
+                msg.get("ToUserName", ""), openid,
+                f"💸 已批量记账 {len(batch)}笔, 共 ¥{total:.2f}:\n"
+                + "\n".join(lines))
+        reply = handle_record(openid, fast_body, source, day=fast_date or "")
+        return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
+
+    # ===== AI Agent 层: 正则快路径未命中的自由表达, 交给LLM决定意图与参数 =====
+    # 硬超时3.8s -> 工具校验执行; 超时/失败 -> 转下方正则兜底(不再二次调LLM);
+    # LLM选了工具但执行失败 -> 提示未理解, 不再盲记垃圾账(避免"分析本月"误记账类问题)
+    agent_attempted, agent_misroute = False, False
+    if LLM_API_KEY:
+        agent_attempted = True
+        try:
+            fut = _llm_pool.submit(agent.route, text)
+            tool_name, tool_arg = fut.result(timeout=agent.AGENT_TIMEOUT + 0.3)
+        except Exception as e:
+            print(f"[agent] 路由超时/失败, 转正则兜底: {e}")
+            tool_name, tool_arg = None, None
+        if tool_name == "chitchat":
+            return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
+                                        "👋 我是记账助手, 直接发「午饭35」就能记账\n"
+                                        "发送【帮助】查看全部命令~")
+        if tool_name and tool_name in AGENT_HANDLERS:
+            try:
+                reply = AGENT_HANDLERS[tool_name](openid, tool_arg or {}, source, text)
+                if reply:
+                    print(f"[agent] LLM路由 -> {tool_name} {tool_arg}")
+                    return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
+            except Exception as e:
+                agent_misroute = True
+                print(f"[agent] {tool_name} 执行失败({e}), 不盲记垃圾账")
+        elif tool_name is None and tool_arg:
+            # 模型判定与记账无关: 直接回复模型文本, 避免被当成账目误记
+            return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
+                                        str(tool_arg)[:300])
+    if agent_misroute:
+        return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
+                                    "🤔 没太理解这条消息~\n"
+                                    "记账直接发「午饭35」; 其他操作可发【帮助】查看命令")
+
+    # Agent路由失败/超时的兜底: 正则解析入库(不再二次调LLM, 避免超微信5秒)
+    # 含删改意图的文本正则兜不住(会被误记成一笔账), AI又没理解时让用户重试
+    if agent_attempted and any(k in text for k in
+                               ("删除", "删掉", "去掉", "改成", "改为", "换成",
+                                "替换为", "变更为", "改到", "挪到", "移到",
+                                "修改", "改账")):
         return wechat.to_text_reply(
             msg.get("ToUserName", ""), openid,
-            f"💸 已批量记账 {len(batch)}笔, 共 ¥{total:.2f}:\n"
-            + "\n".join(lines))
-
-    # 记账: 同步解析, 结果作为被动回复(未认证订阅号无客服消息接口)
-    reply = handle_record(openid, text, source)
+            "⏳ AI处理超时了, 请再发一次试试~\n删改账也可直接用命令:\n"
+            "  删除9月7日 餐饮 35\n  修改9月7日 餐饮 35 打车 40")
+    reply = handle_record(openid, text, source, use_llm=not agent_attempted)
     return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
 
 

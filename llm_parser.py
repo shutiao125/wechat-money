@@ -153,9 +153,9 @@ def annual_report(year: str, data: dict) -> str | None:
                     timeout=20, max_tokens=700)
 
 
-def parse_record(text: str) -> dict:
+def parse_record(text: str, use_llm: bool = True) -> dict:
     """入口: 优先按"名称 金额"取类别(用户输入什么类别就记什么, 如"咖啡6"->咖啡);
-    无法干净拆分时再用LLM/正则兜底"""
+    无法干净拆分时再用LLM/正则兜底; use_llm=False 跳过大模型只用正则"""
     items = tokenize_amounts(text)
     if items and len(items) == 1:
         name, amt = items[0]
@@ -164,7 +164,7 @@ def parse_record(text: str) -> dict:
                               ("工资", "到账", "收入", "进账", "收到红包")) else "支出"
         return {"date": today, "type": rtype, "category": name,
                 "subcategory": "", "amount": amt, "note": name}
-    if LLM_API_KEY:
+    if LLM_API_KEY and use_llm:
         try:
             return _llm_parse(text)
         except Exception as e:
