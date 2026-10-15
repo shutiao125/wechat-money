@@ -2,6 +2,7 @@
 运行: python app.py  (开发时配合内网穿透暴露公网HTTPS)
 """
 import re
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -13,13 +14,47 @@ from config import (WECHAT_TOKEN, ALLOWED_OPENIDS, PUSH_TOKEN,
 import wechat
 import db
 import agent
-from llm_parser import (parse_record, ai_report, parse_batch,
-                        tokenize_amounts, annual_report, ai_summary)
+from llm_parser import (parse_record, ai_report, parse_batch, classify_local,
+                        _cf_classify, tokenize_amounts, annual_report, ai_summary)
 from report import (build_daily_report, build_weekly_report,
                     build_annual_report, push_daily, push_weekly, push_annual)
 
 app = Flask(__name__)
 db.init_db()
+
+# ==================== 大类(subcategory)回填 ====================
+def _backfill_subcategories():
+    """启动时先本地回填历史记录大类(避免几百条同时调AI阻塞启动):
+    收入直接归"收入", 支出用本地关键词; 所有回填都标 local,
+    由 _subcat_worker 继续用AI逐条复核为最终结果"""
+    rows = db.unclassified_records()
+    if not rows:
+        return
+    n = 0
+    for r in rows:
+        sub = classify_local(r["category"], r["type"])
+        if sub:
+            db.update_record_subcategory(r["id"], sub, "local")
+            n += 1
+    print(f"[subcat] 启动本地回填 {n}/{len(rows)} 条, 其余留待AI复核")
+
+
+def _subcat_worker():
+    """后台线程: 逐条用AI复核所有未定稿(subcat_src != 'ai')记录的大类,
+    每30秒一批, 不阻塞微信5秒回复"""
+    while True:
+        try:
+            for r in db.unclassified_records(limit=20):
+                sub = _cf_classify(r["category"], r["type"])
+                if sub:
+                    db.update_record_subcategory(r["id"], sub, "ai")
+        except Exception as e:
+            print(f"[subcat] AI复核异常: {e}")
+        time.sleep(30)
+
+
+_backfill_subcategories()
+threading.Thread(target=_subcat_worker, daemon=True).start()
 
 # MsgId去重(微信5秒无响应会重试推送)
 _seen_msgs = set()
@@ -28,6 +63,44 @@ _seen_lock = threading.Lock()
 # AI分析专用线程池: 用 result(timeout) 强制"总时长"硬超时(requests的read
 # timeout只看两次读间隔, 无法限制总时长, 曾导致被动回复超过微信5秒上限)
 _llm_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm")
+
+
+def _pick_subcategory(name: str, rtype: str, ai_timeout: float = 2.0):
+    """记账时AI优先判断大类: 硬超时2.2s内完成, 超时/失败/未配置 -> 本地关键词兜底;
+    本地也判断不了则暂归"其他"(标local, 后台AI可复核修正)
+    返回 (大类, 来源); 来源: ai=AI判断, local=本地兜底"""
+    try:
+        fut = _llm_pool.submit(_cf_classify, name, rtype, ai_timeout)
+        sub = fut.result(timeout=ai_timeout + 0.2)
+        if sub:
+            return sub, "ai"
+    except Exception as e:
+        print(f"[subcat] AI判断超时/失败({e}), 本地兜底")
+    sub = classify_local(name, rtype)
+    if sub:
+        return sub, "local"
+    return "其他", "local"
+
+
+def _pick_subcategories(pairs):
+    """批量并发AI判断大类: 所有项同时提交, 总硬超时2.2s, 超时/失败本地兜底
+    pairs: [(name, rtype), ...] -> [(大类, 来源), ...]"""
+    if not pairs:
+        return []
+    futs = [_llm_pool.submit(_cf_classify, name, rtype, 2.0)
+            for name, rtype in pairs]
+    results, deadline = [], time.monotonic() + 2.2
+    for (name, rtype), fut in zip(pairs, futs):
+        try:
+            remain = deadline - time.monotonic()
+            sub = fut.result(timeout=max(remain, 0.05))
+            if sub:
+                results.append((sub, "ai"))
+                continue
+        except Exception:
+            pass
+        results.append((classify_local(name, rtype) or "其他", "local"))
+    return results
 
 WELCOME = (
     "👋 欢迎使用记账助手!\n"
@@ -124,8 +197,9 @@ def _strip_date(s: str):
 
 
 def _cat_disp(r):
-    """显示用分类: 大分类·细分类"""
-    return r["category"] + (f"·{r.get('subcategory')}" if r.get("subcategory") else "")
+    """显示用分类: 细分类（大类）; 未归大类时只显示细分类"""
+    sub = r.get("subcategory") or ""
+    return r["category"] + (f"（{sub}）" if sub else "")
 
 
 def _analysis_data(openid: str, period: str):
@@ -246,12 +320,14 @@ def _agent_record(openid: str, args: dict, source: str, text: str = "") -> str:
             ("收入" if _income_cat(cat) else "支出")
         note = str(it.get("note") or cat)[:20]
         rows.append((rtype, cat, amt, note))
-    for rtype, cat, amt, note in rows:
-        db.add_record(openid, day, rtype, cat, amt, note, source, cat)
+    subs = _pick_subcategories([(c, t) for t, c, _, _ in rows])
+    for (rtype, cat, amt, note), (sub, src) in zip(rows, subs):
+        db.add_record(openid, day, rtype, cat, amt, note, source, sub, src)
     if len(rows) == 1:
         rtype, cat, amt, note = rows[0]
         icon = "💸" if rtype == "支出" else "💰"
-        return (f"{icon} 已记账 {day}\n{cat} ¥{amt:.2f} | {note}\n"
+        note_part = f" | {note}" if note != cat else ""
+        return (f"{icon} 已记账 {day}\n{cat} ¥{amt:.2f}{note_part}\n"
                 f"发送【今日】查看汇总")
     total = round(sum(a for _, _, a, _ in rows), 2)
     lines = [f"  {c} ¥{a:.2f}" for _, c, a, _ in rows]
@@ -408,7 +484,8 @@ def _agent_query(openid: str, args: dict, source: str, text: str = "") -> str:
         if not rows:
             return f"📭 {day} 没有账目记录"
         total = sum(r["amount"] for r in rows)
-        lines = [f"{r['type']} {_cat_disp(r)} ¥{r['amount']:.2f} {r['note']}"
+        lines = [f"{r['type']} {_cat_disp(r)} ¥{r['amount']:.2f}"
+                 + (f" {r['note']}" if r["note"] and r["note"] != r["category"] else "")
                  for r in rows]
         return (f"📅 {day} 共{len(rows)}笔, 合计 ¥{total:.2f}:\n"
                 + "\n".join(lines)
@@ -443,15 +520,22 @@ def handle_record(openid: str, text: str, source: str, day: str = "",
                   use_llm: bool = True) -> str:
     """同步解析并入库, 返回确认文本(作为被动回复, 未认证订阅号无客服消息接口)
     day 非空时覆盖解析出的日期(供补记/修改指定日期使用)
-    use_llm=False 时跳过大模型解析只用正则(Agent层已调过LLM时, 避免超5秒)"""
+    use_llm=False 时跳过大模型解析只用正则(Agent层已调过LLM时, 避免超5秒)
+    大类判断: LLM解析已带回(subcategory=ai); 快路径由 _pick_subcategory
+    用AI优先判断(硬超时2.2s), 失败才本地兜底"""
     r = parse_record(text, use_llm=use_llm)
-    sub = r.get("subcategory", "")
+    sub = r.get("subcategory", "") or ""
+    if sub:
+        src = "ai"
+    else:
+        sub, src = _pick_subcategory(r["category"], r["type"])
     tx_date = day or r["date"]
     db.add_record(openid, tx_date, r["type"], r["category"],
-                  r["amount"], r["note"], source, sub)
+                  r["amount"], r["note"], source, sub, src)
     icon = "💸" if r["type"] == "支出" else "💰"
+    note_part = f" | {r['note']}" if r.get("note") and r["note"] != r["category"] else ""
     return (f"{icon} 已记账 {tx_date}\n"
-            f"{_cat_disp(r)} ¥{r['amount']:.2f} | {r['note']}\n"
+            f"{_cat_disp(r)} ¥{r['amount']:.2f}{note_part}\n"
             f"发送【今日】查看汇总")
 
 
@@ -543,8 +627,8 @@ def wechat_callback():
             return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
                                         "📭 还没有任何记账记录")
         lines = [f"{r['tx_date']} {_cat_disp(r)} ¥{r['amount']:.2f} "
-                 f"{r['note']} [{r['type']}]"
-                 for r in rows]
+                 f"{r['note'] if r['note'] != r['category'] else ''} [{r['type']}]"
+                 .replace("  [", " [") for r in rows]
         return wechat.to_text_reply(
             msg.get("ToUserName", ""), openid,
             "📋 最近5笔:\n" + "\n".join(lines))
@@ -587,7 +671,8 @@ def wechat_callback():
             return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
                                         f"📭 {day} 没有账目记录")
         total = sum(r["amount"] for r in rows)
-        lines = [f"{r['type']} {_cat_disp(r)} ¥{r['amount']:.2f} {r['note']}"
+        lines = [f"{r['type']} {_cat_disp(r)} ¥{r['amount']:.2f}"
+                 + (f" {r['note']}" if r["note"] and r["note"] != r["category"] else "")
                  for r in rows]
         return wechat.to_text_reply(
             msg.get("ToUserName", ""), openid,
@@ -767,11 +852,12 @@ def wechat_callback():
         batch = parse_batch(fast_body)
         if batch:                                # ≥2笔: 批量秒记
             tx_date = fast_date or datetime.now().strftime("%Y-%m-%d")
+            subs = _pick_subcategories([(c, "支出") for _, _, c in batch])
             lines, total = [], 0.0
-            for note, amt, cat in batch:
-                db.add_record(openid, tx_date, "支出", cat, amt, note, source, note)
+            for (note, amt, cat), (sub, _src) in zip(batch, subs):
+                db.add_record(openid, tx_date, "支出", cat, amt, note, source, sub, _src)
                 total += amt
-                lines.append(f"  {cat}·{note} ¥{amt:.2f}")
+                lines.append(f"  {note} ¥{amt:.2f}")
             return wechat.to_text_reply(
                 msg.get("ToUserName", ""), openid,
                 f"💸 已批量记账 {len(batch)}笔, 共 ¥{total:.2f}:\n"

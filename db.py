@@ -22,25 +22,29 @@ def init_db():
             tx_date  TEXT NOT NULL,           -- YYYY-MM-DD
             type     TEXT NOT NULL,           -- 支出 / 收入
             category TEXT NOT NULL,           -- 分类
-            subcategory TEXT DEFAULT '',      -- 细分类
+            subcategory TEXT DEFAULT '',      -- 大类
+            subcat_src TEXT DEFAULT '',       -- 大类来源: ''未归类 / local本地 / ai AI复核
             amount   REAL NOT NULL,
             note     TEXT DEFAULT '',
             source   TEXT DEFAULT 'text',     -- text / voice / manual
             created_at TEXT DEFAULT (datetime('now','localtime')))""")
-        # 迁移: 老库补充 subcategory 列
+        # 迁移: 老库补充 subcategory / subcat_src 列
         cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
         if "subcategory" not in cols:
             conn.execute("ALTER TABLE records ADD COLUMN subcategory TEXT DEFAULT ''")
+        if "subcat_src" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN subcat_src TEXT DEFAULT ''")
 
 
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
                amount: float, note: str = "", source: str = "text",
-               subcategory: str = ""):
+               subcategory: str = "", subcat_src: str = ""):
     with _lock, _conn() as conn:
         conn.execute(
             "INSERT INTO records(openid,tx_date,type,category,subcategory,"
-            "amount,note,source) VALUES(?,?,?,?,?,?,?,?)",
-            (openid, tx_date, rtype, category, subcategory, amount, note, source))
+            "subcat_src,amount,note,source) VALUES(?,?,?,?,?,?,?,?,?)",
+            (openid, tx_date, rtype, category, subcategory, subcat_src,
+             amount, note, source))
 
 
 def _sums(where: str, args: tuple, openid: str) -> dict:
@@ -62,14 +66,20 @@ def month_stats(openid: str, month: str) -> dict:
     return _sums("substr(tx_date,1,7)=?", (month,), openid)
 
 
-def month_by_category(openid: str, month: str) -> list:
-    """本月各分类支出, 按金额降序"""
+def _cat_agg(where: str, args: tuple, openid: str) -> list:
+    """各分类支出聚合: 大类(subcategory)优先, 未归类则退化为细分类(category)"""
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT category, SUM(amount) AS s FROM records "
-            "WHERE openid=? AND type='支出' AND substr(tx_date,1,7)=? "
-            "GROUP BY category ORDER BY s DESC", (openid, month)).fetchall()
-    return [(r["category"], round(r["s"], 2)) for r in rows]
+            f"SELECT COALESCE(NULLIF(subcategory,''), category) AS cat, "
+            f"SUM(amount) AS s FROM records "
+            f"WHERE openid=? AND type='支出' AND {where} "
+            f"GROUP BY cat ORDER BY s DESC", (openid, *args)).fetchall()
+    return [(r["cat"], round(r["s"], 2)) for r in rows]
+
+
+def month_by_category(openid: str, month: str) -> list:
+    """本月各分类支出(按大类聚合), 按金额降序"""
+    return _cat_agg("substr(tx_date,1,7)=?", (month,), openid)
 
 
 def week_stats(openid: str, start: str, end: str) -> dict:
@@ -78,14 +88,8 @@ def week_stats(openid: str, start: str, end: str) -> dict:
 
 
 def week_by_category(openid: str, start: str, end: str) -> list:
-    """一周内各分类支出, 按金额降序"""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT category, SUM(amount) AS s FROM records "
-            "WHERE openid=? AND type='支出' AND tx_date>=? AND tx_date<=? "
-            "GROUP BY category ORDER BY s DESC",
-            (openid, start, end)).fetchall()
-    return [(r["category"], round(r["s"], 2)) for r in rows]
+    """一周内各分类支出(按大类聚合), 按金额降序"""
+    return _cat_agg("tx_date>=? AND tx_date<=?", (start, end), openid)
 
 
 def week_daily(openid: str, start: str, end: str) -> list:
@@ -108,14 +112,8 @@ def year_stats(openid: str, year: str) -> dict:
 
 
 def year_by_category(openid: str, year: str) -> list:
-    """整年各分类支出, 按金额降序"""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT category, SUM(amount) AS s FROM records "
-            "WHERE openid=? AND type='支出' AND substr(tx_date,1,4)=? "
-            "GROUP BY category ORDER BY s DESC",
-            (openid, year)).fetchall()
-    return [(r["category"], round(r["s"], 2)) for r in rows]
+    """整年各分类支出(按大类聚合), 按金额降序"""
+    return _cat_agg("substr(tx_date,1,4)=?", (year,), openid)
 
 
 def year_monthly(openid: str, year: str) -> list:
@@ -172,3 +170,19 @@ def day_records(openid: str, day: str) -> list:
             "SELECT id, tx_date, type, category, subcategory, amount, note FROM records "
             "WHERE openid=? AND tx_date=? ORDER BY id", (openid, day)).fetchall()
     return [dict(r) for r in rows]
+
+
+def unclassified_records(limit: int = 500) -> list:
+    """待AI复核/回填的记录(subcat_src != 'ai'): [(id, category, type)]"""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, category, type FROM records "
+            "WHERE subcat_src != 'ai' ORDER BY id LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_record_subcategory(rid: int, subcategory: str, src: str = ""):
+    """按记录id回填/修正大类, 同时记录来源(local/ai)"""
+    with _lock, _conn() as conn:
+        conn.execute("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
+                     (subcategory, src, rid))
