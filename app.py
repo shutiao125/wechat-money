@@ -4,6 +4,7 @@
 import re
 import time
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -24,9 +25,35 @@ app = Flask(__name__)
 db.init_db()
 
 
+# 回复缓存: 内存优先(重试秒回, 不被慢写拖住); 落库转后台异步, 且不抢用户请求的锁
+_mem_replies, _mem_lock = OrderedDict(), threading.Lock()
+_persist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="persist")
+
+
+def _remember_reply(msg_id: str, payload: str):
+    with _mem_lock:
+        _mem_replies[msg_id] = payload
+        while len(_mem_replies) > 300:                  # 只留最近300条, 防止无限增长
+            _mem_replies.popitem(last=False)
+
+
+def _mem_reply(msg_id: str):
+    with _mem_lock:
+        return _mem_replies.get(msg_id)
+
+
+def _persist_reply(msg_id: str, payload: str):
+    try:
+        db.save_wechat_reply(msg_id, payload, best_effort=True)
+    except Exception as e:
+        print(f"[wechat] 回复缓存落库跳过(不影响本次回复): {type(e).__name__}: {e}",
+              flush=True)
+
+
 @app.after_request
 def _cache_wechat_reply(response):
-    """将成功生成的被动XML回复持久化，供微信同一MsgId重试时重放。"""
+    """把生成的被动XML回复记入内存缓存(供微信同一MsgId重试时重放),
+    并投给后台线程落库; 落库慢也不阻塞回复"""
     try:
         if request.path == "/wechat" and request.method == "POST":
             msg = wechat.parse_xml(request.get_data(cache=True))
@@ -34,7 +61,8 @@ def _cache_wechat_reply(response):
             if msg_id and response.status_code == 200:
                 payload = response.get_data(as_text=True)
                 if payload.lstrip().startswith("<xml>"):
-                    db.save_wechat_reply(msg_id, payload)
+                    _remember_reply(msg_id, payload)
+                    _persist_pool.submit(_persist_reply, msg_id, payload)
     except Exception as e:
         print(f"[wechat] 回复缓存写入失败: {type(e).__name__}: {e}", flush=True)
     return response
@@ -643,9 +671,10 @@ def wechat_callback():
         return wechat.to_text_reply(msg.get("ToUserName", ""), openid, WELCOME)
 
     # 微信超时重试时重放上次完整回复；不能只返回 success，否则用户收不到回复。
+    # 内存缓存优先(秒回, 不受网络盘影响), 命中不了再查库(跨重启保留)
     msg_id = msg.get("MsgId", "")
     if msg_id:
-        cached_reply = db.get_wechat_reply(msg_id)
+        cached_reply = _mem_reply(msg_id) or db.get_wechat_reply(msg_id)
         if cached_reply:
             print(f"[wechat] 重放已缓存回复 MsgId={msg_id}", flush=True)
             return cached_reply

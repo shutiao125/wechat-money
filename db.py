@@ -10,11 +10,17 @@ from config import DB_PATH
 
 
 def _caller() -> str:
-    """慢会话打点用: 取第一个db.py之外的调用函数名"""
+    """慢会话打点用: 报出"db操作函数 <- 上层调用者"(跳过contextlib与db.py内部帧)"""
     f = sys._getframe(2)
-    while f and f.f_code.co_filename == __file__:
+    while f and "contextlib" in f.f_code.co_filename:      # with语句由contextlib驱动
         f = f.f_back
-    return f.f_code.co_name if f else "?"
+    if not f:
+        return "?"
+    op = f.f_code.co_name
+    g = f.f_back
+    while g and g.f_code.co_filename == __file__:          # 跳过db.py内部调用
+        g = g.f_back
+    return f"{op} <- {g.f_code.co_name}" if g else op
 
 
 class _DbLock:
@@ -34,9 +40,11 @@ class _DbLock:
         self._since = 0.0                   # 持锁起始时刻(单调时钟)
 
     @contextmanager
-    def hold(self, timeout: float = 2.0):
+    def hold(self, timeout: float = 2.0, wait: bool = True):
         me = threading.get_ident()
         with self._cv:
+            if not wait and self._holder is not None:
+                raise TimeoutError("数据库忙(后台写放弃, 不抢占用户请求)")
             deadline = time.monotonic() + timeout
             while self._holder is not None:
                 held = time.monotonic() - self._since
@@ -82,12 +90,13 @@ def _conn() -> sqlite3.Connection:
 
 
 @contextmanager
-def _session():
+def _session(wait: bool = True):
     """连接会话: 进程内串行(带锁超时/自愈) + 正常结束提交, 异常回滚, 无论成败都关闭连接
     (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)
     网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化;
-    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复"""
-    with _lock.hold(2.0):
+    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复
+    wait=False: 供后台写使用, 锁被占用时立即放弃而非排队"""
+    with _lock.hold(2.0, wait=wait):
         t0 = time.monotonic()
         conn = _conn()          # 建连在锁内: 由 _lock.hold 的finally兜底释放, 不会泄漏
         t1 = time.monotonic()
@@ -151,11 +160,12 @@ def get_wechat_reply(msg_id: str):
     return row["response_xml"] if row else None
 
 
-def save_wechat_reply(msg_id: str, response_xml: str):
-    """保存完整被动回复；幂等更新，保留最近7天缓存。"""
+def save_wechat_reply(msg_id: str, response_xml: str, best_effort: bool = False):
+    """保存完整被动回复；幂等更新，保留最近7天缓存。
+    best_effort=True: 后台写, 锁被别人占用时直接放弃(不抢用户请求的锁)"""
     if not msg_id or not response_xml or not response_xml.lstrip().startswith("<xml>"):
         return
-    with _session() as conn:
+    with _session(wait=not best_effort) as conn:
         conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
             ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
             created_at=datetime('now','localtime')""", (msg_id, response_xml))
