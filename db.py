@@ -10,9 +10,19 @@ _lock = threading.Lock()
 
 
 def _conn() -> sqlite3.Connection:
-    # 等待锁上限压到3秒: 微信被动回复只有5秒窗口, 绝不能在这里卡到5秒以上
-    conn = sqlite3.connect(DB_PATH, timeout=3.0)
+    conn = sqlite3.connect(DB_PATH, timeout=2.0)
     conn.row_factory = sqlite3.Row
+    # 部署环境的home是网络盘: 默认的rollback journal每次提交都要建文件+fsync,
+    # 在慢盘上极易卡死几分钟(请求被uWSGI harakiri杀掉)。改用内存日志 +
+    # 关闭同步, 把每次提交的网络I/O降到最低; busy_timeout限制SQLite级等锁
+    try:
+        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+    except Exception as e:
+        conn.close()
+        raise RuntimeError(f"数据库初始化失败: {e}")
     return conn
 
 
@@ -25,26 +35,29 @@ def _session():
     避免被后台线程持锁卡住后无限等待直到uWSGI harakiri强杀"""
     if not _lock.acquire(timeout=2.0):
         raise TimeoutError("数据库忙, 请稍后重试")
-    conn = _conn()
+    # 注意: 建连/PRAGMA也必须在try内, 否则connect()抛错时锁不释放会永久泄漏,
+    # 之后所有请求都报"数据库忙"直到harakiri重启
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        conn = _conn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     finally:
-        conn.close()
         _lock.release()
 
 
 def init_db():
     with _session() as conn:
-        # 不要用WAL: 部署环境(如PythonAnywhere)的home是网络盘, WAL依赖-shm共享内存,
-        # 在这种盘上会退化为极慢甚至直接卡死(请求卡到被uWSGI harakiri杀掉, 不报错)。
-        # 改用默认的 rollback journal(DELETE), 配合上面_session的进程内串行锁避免冲突
-        mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-        conn.execute("PRAGMA busy_timeout=3000")
-        # 启动打点: 真实库路径 + 实际生效的日志模式(应为delete)
+        # 网络盘上WAL依赖-shm共享内存会卡死; DELETE日志每次提交都要建文件+fsync也很慢。
+        # 统一用内存日志(与_conn里的PRAGMA一致), 只保留建表这类必须的落盘
+        mode = conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0]
+        conn.execute("PRAGMA busy_timeout=2000")
+        # 启动打点: 真实库路径 + 实际生效的日志模式(应为memory)
         print(f"[db] DB_PATH={DB_PATH} journal_mode={mode}")
         conn.execute("""CREATE TABLE IF NOT EXISTS records(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,3 +255,14 @@ def update_record_subcategory(rid: int, subcategory: str, src: str = ""):
     with _session() as conn:
         conn.execute("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
                      (subcategory, src, rid))
+
+
+def update_subcategories_bulk(updates: list):
+    """批量回填/修正大类, 单次事务提交
+    (网络盘上每次commit都有落盘开销, 合并提交可把N次I/O降为1次)
+    updates: [(id, subcategory, src), ...]"""
+    if not updates:
+        return
+    with _session() as conn:
+        conn.executemany("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
+                         [(sub, src, rid) for rid, sub, src in updates])

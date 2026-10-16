@@ -65,17 +65,19 @@ def _on_unhandled(e):
 def _backfill_subcategories():
     """启动时先本地回填历史记录大类(避免几百条同时调AI阻塞启动):
     收入直接归"收入", 支出用本地关键词; 所有回填都标 local,
-    由 _subcat_worker 继续用AI逐条复核为最终结果"""
+    由 _subcat_worker 继续用AI逐条复核为最终结果;
+    多条合并为一次提交, 避免网络盘上逐条commit拖慢启动"""
     rows = db.unclassified_records()
     if not rows:
         return
-    n = 0
+    updates = []
     for r in rows:
         sub = classify_local(r["category"], r["type"])
         if sub:
-            db.update_record_subcategory(r["id"], sub, "local")
-            n += 1
-    print(f"[subcat] 启动本地回填 {n}/{len(rows)} 条, 其余留待AI复核")
+            updates.append((r["id"], sub, "local"))
+    if updates:
+        db.update_subcategories_bulk(updates)
+    print(f"[subcat] 启动本地回填 {len(updates)}/{len(rows)} 条, 其余留待AI复核")
 
 
 # 后台AI复核专用单线程池: 对每条记录用 result(timeout) 强制"总时长"硬超时,
@@ -87,9 +89,10 @@ _subcat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subcat")
 def _subcat_worker():
     """后台线程: 逐条用AI复核所有未定稿(subcat_src != 'ai')记录的大类,
     每8秒一批, 完全在后台执行, 不占用/阻塞微信5秒回复;
-    单条复核总时长≤2秒, 数据库读写各有2秒锁超时保护, 绝不影响微信请求"""
+    单条复核总时长≤2秒, 一批写回一次提交, 绝不影响微信请求"""
     while True:
         try:
+            updates = []
             for r in db.unclassified_records(limit=10):
                 try:
                     fut = _subcat_pool.submit(_cf_classify, r["category"], r["type"])
@@ -98,10 +101,12 @@ def _subcat_worker():
                     print(f"[subcat] 单条复核超时/失败: {e}")
                     sub = None
                 if sub:
-                    try:
-                        db.update_record_subcategory(r["id"], sub, "ai")
-                    except Exception as e:
-                        print(f"[subcat] 写回失败: {e}")
+                    updates.append((r["id"], sub, "ai"))
+            if updates:
+                try:
+                    db.update_subcategories_bulk(updates)
+                except Exception as e:
+                    print(f"[subcat] 批量写回失败: {e}")
         except Exception as e:
             print(f"[subcat] AI复核异常: {e}")
         time.sleep(8)
