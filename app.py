@@ -550,18 +550,51 @@ def wechat_callback():
         return "签名校验失败", 403
 
     # ---------- POST: 消息处理 ----------
-    if not wechat.check_signature(WECHAT_TOKEN, request.args.get("signature", ""),
-                                  request.args.get("timestamp", ""),
-                                  request.args.get("nonce", "")):
+    # 诊断日志：签名失败/XML解析失败此前会静默返回 success。
+    # 不记录 signature/token 等凭据；flush=True 让日志及时显示。
+    signature = request.args.get("signature", "")
+    timestamp = request.args.get("timestamp", "")
+    nonce = request.args.get("nonce", "")
+    body = request.get_data(cache=True)
+    signature_ok = wechat.check_signature(
+        WECHAT_TOKEN, signature, timestamp, nonce
+    )
+    print(
+        f"[wechat-debug] POST /wechat signature_ok={signature_ok} "
+        f"token_configured={bool(WECHAT_TOKEN)} timestamp_present={bool(timestamp)} "
+        f"nonce_present={bool(nonce)} body_bytes={len(body)} "
+        f"content_type={request.content_type!r}",
+        flush=True,
+    )
+    if not signature_ok:
+        print(
+            "[wechat-debug] 签名校验失败；请核对公众号配置中的 Token "
+            "与 PythonAnywhere 环境变量 WECHAT_TOKEN。",
+            flush=True,
+        )
         return "success"
-    msg = wechat.parse_xml(request.data)
+
+    try:
+        msg = wechat.parse_xml(body)
+    except Exception as e:
+        print(
+            f"[wechat-debug] XML解析异常: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return "success"
     if not msg:
+        print(
+            f"[wechat-debug] XML解析结果为空，body_bytes={len(body)}；"
+            "请检查请求体格式。",
+            flush=True,
+        )
         return "success"
 
     openid = msg.get("FromUserName", "")
     msg_type = msg.get("MsgType", "")
-    print(f"[msg] openid={openid!r} MsgType={msg_type!r} Content={msg.get('Content','')!r}",
+    print(f"[msg] openid={openid!r} MsgType={msg_type!r} Content={msg.get('Content', '')!r}",
           flush=True)
+
     if not _allowed(openid):
         # 白名单拦截时返回空success(无回复无报错), 打印原因便于排查
         print(f"[wechat] ⚠️ 白名单拦截: openid={openid!r} 不在 ALLOWED_OPENIDS={ALLOWED_OPENIDS!r}")
