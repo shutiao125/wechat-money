@@ -37,5 +37,8 @@ if not os.path.isabs(DB_PATH):
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
 PUSH_TOKEN = os.getenv("PUSH_TOKEN", "")                        # 敏感: 手动触发推送口令, 用环境变量设置
 RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "1") == "1"                # 内置定时推送开关(本机运行用)
+# 后台AI大类复核开关: 默认关闭。它会常驻线程反复读写账本库, 在PythonAnywhere
+# 这类网络盘上极易卡住DB锁导致微信请求超时; 需要时设 SUBCAT_AI=1 打开
+SUBCAT_AI = os.getenv("SUBCAT_AI", "0") == "1"
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "21"))                         # 每日推送时间: 点
 PUSH_MINUTE = int(os.getenv("PUSH_MINUTE", "30"))                     # 每日推送时间: 分

@@ -2,11 +2,56 @@
 """记账存储: SQLite单文件, 线程安全"""
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 
 from config import DB_PATH
 
-_lock = threading.Lock()
+
+class _DbLock:
+    """进程内串行锁: 等锁超时 + 卡死自愈 + 持有者可追溯
+
+    正常时所有DB读写串行, 后来者最多等 timeout 秒;
+    若持有者超过 STUCK_TTL 仍未释放(网络盘I/O卡住/建连卡住), 后来者会
+    放弃该持有者继续执行, 避免"一个卡住的调用让整个服务瘫到uWSGI harakiri"。
+    真实文件访问仍由SQLite自身锁兜底, 抢占后最坏是报 database is locked,
+    由调用方降级回复(远好过整个服务10分钟无响应)。"""
+
+    STUCK_TTL = 15.0
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._holder = None                 # 持有者线程 ident
+        self._since = 0.0                   # 持锁起始时刻(单调时钟)
+
+    @contextmanager
+    def hold(self, timeout: float = 2.0):
+        me = threading.get_ident()
+        with self._cv:
+            deadline = time.monotonic() + timeout
+            while self._holder is not None:
+                held = time.monotonic() - self._since
+                if held > self.STUCK_TTL:        # 持有者疑似卡死 -> 抢占自愈
+                    print(f"[db] ⚠️ 线程{self._holder}持锁已{held:.0f}s未释放, "
+                          f"判定卡死并抢占(线程{me}继续)", flush=True)
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    print(f"[db] ⚠️ 等锁超时: 线程{self._holder}已持锁{held:.1f}s",
+                          flush=True)
+                    raise TimeoutError("数据库忙, 请稍后重试")
+                self._cv.wait(min(0.2, remain))
+            self._holder, self._since = me, time.monotonic()
+        try:
+            yield
+        finally:
+            with self._cv:
+                if self._holder == me:
+                    self._holder = None
+                self._cv.notify_all()
+
+
+_lock = _DbLock()
 
 
 def _conn() -> sqlite3.Connection:
@@ -28,17 +73,12 @@ def _conn() -> sqlite3.Connection:
 
 @contextmanager
 def _session():
-    """连接会话: 进程内串行(带2秒锁超时) + 正常结束提交, 异常回滚, 无论成败都关闭连接
+    """连接会话: 进程内串行(带锁超时/自愈) + 正常结束提交, 异常回滚, 无论成败都关闭连接
     (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)
     网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化;
-    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复,
-    避免被后台线程持锁卡住后无限等待直到uWSGI harakiri强杀"""
-    if not _lock.acquire(timeout=2.0):
-        raise TimeoutError("数据库忙, 请稍后重试")
-    # 注意: 建连/PRAGMA也必须在try内, 否则connect()抛错时锁不释放会永久泄漏,
-    # 之后所有请求都报"数据库忙"直到harakiri重启
-    try:
-        conn = _conn()
+    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复"""
+    with _lock.hold(2.0):
+        conn = _conn()          # 建连在锁内: 由 _lock.hold 的finally兜底释放, 不会泄漏
         try:
             yield conn
             conn.commit()
@@ -47,8 +87,6 @@ def _session():
             raise
         finally:
             conn.close()
-    finally:
-        _lock.release()
 
 
 def init_db():

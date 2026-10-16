@@ -11,7 +11,7 @@ from flask import Flask, request
 from werkzeug.exceptions import HTTPException
 
 from config import (WECHAT_TOKEN, ALLOWED_OPENIDS, PUSH_TOKEN,
-                    RUN_SCHEDULER, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY)
+                    RUN_SCHEDULER, SUBCAT_AI, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY)
 import wechat
 import db
 import agent
@@ -113,7 +113,11 @@ def _subcat_worker():
 
 
 _backfill_subcategories()
-threading.Thread(target=_subcat_worker, daemon=True).start()
+if SUBCAT_AI:
+    threading.Thread(target=_subcat_worker, daemon=True).start()
+    print("[subcat] 后台AI大类复核已启动(SUBCAT_AI=1)")
+else:
+    print("[subcat] 后台AI大类复核已关闭(默认); 需要时设 SUBCAT_AI=1 启用")
 
 # MsgId回复缓存存储在SQLite中，跨uWSGI worker有效；不提前在内存标记消息已处理。
 
