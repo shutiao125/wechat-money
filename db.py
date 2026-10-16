@@ -2,7 +2,7 @@
 """记账存储: SQLite单文件, 线程安全"""
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import contextmanager
 
 from config import DB_PATH
 
@@ -15,8 +15,23 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _session():
+    """连接会话: 正常结束提交, 异常回滚, 无论成败都关闭连接
+    (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)"""
+    conn = _conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db():
-    with closing(_conn()) as conn:
+    with _session() as conn:
         # WAL: 读写并发不互斥, 大幅避免 database is locked
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=8000")
@@ -43,7 +58,7 @@ def init_db():
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
                amount: float, note: str = "", source: str = "text",
                subcategory: str = "", subcat_src: str = ""):
-    with _lock, closing(_conn()) as conn:
+    with _lock, _session() as conn:
         conn.execute(
             "INSERT INTO records(openid,tx_date,type,category,subcategory,"
             "subcat_src,amount,note,source) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -52,7 +67,7 @@ def add_record(openid: str, tx_date: str, rtype: str, category: str,
 
 
 def _sums(where: str, args: tuple, openid: str) -> dict:
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             f"SELECT type, SUM(amount) AS s FROM records "
             f"WHERE openid=? AND {where} GROUP BY type", (openid, *args)).fetchall()
@@ -72,7 +87,7 @@ def month_stats(openid: str, month: str) -> dict:
 
 def _cat_agg(where: str, args: tuple, openid: str) -> list:
     """各分类支出聚合: 大类(subcategory)优先, 未归类则退化为细分类(category)"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             f"SELECT COALESCE(NULLIF(subcategory,''), category) AS cat, "
             f"SUM(amount) AS s FROM records "
@@ -98,7 +113,7 @@ def week_by_category(openid: str, start: str, end: str) -> list:
 
 def week_daily(openid: str, start: str, end: str) -> list:
     """一周内每天支出统计(旧→新): [(日期, 支出, 收入)]"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             "SELECT tx_date, "
             "SUM(CASE WHEN type='支出' THEN amount ELSE 0 END) AS e, "
@@ -122,7 +137,7 @@ def year_by_category(openid: str, year: str) -> list:
 
 def year_monthly(openid: str, year: str) -> list:
     """整年逐月支出统计(1~12月): [(YYYY-MM, 支出, 收入)]"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             "SELECT substr(tx_date,1,7) AS m, "
             "SUM(CASE WHEN type='支出' THEN amount ELSE 0 END) AS e, "
@@ -136,7 +151,7 @@ def year_monthly(openid: str, year: str) -> list:
 
 def recent_records(openid: str, limit: int = 5) -> list:
     """最近几笔记录(新→旧), 含id供删除用"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             "SELECT id, tx_date, type, category, subcategory, amount, note FROM records "
             "WHERE openid=? ORDER BY id DESC LIMIT ?", (openid, limit)).fetchall()
@@ -148,7 +163,7 @@ def delete_record_by_match(openid: str, tx_date: str, kind: str, amount,
     """按日期+分类(或细分类)+金额删除一条账目; amount 为 None 时不限金额
     note 非空时再按备注精确匹配
     多个匹配时删除最早的一笔; 返回(被删记录dict, 剩余相同记录数); 无匹配返回(None, 0)"""
-    with _lock, closing(_conn()) as conn:
+    with _lock, _session() as conn:
         where = "openid=? AND tx_date=? AND (category=? OR subcategory=?)"
         args = [openid, tx_date, kind, kind]
         if amount is not None:
@@ -169,7 +184,7 @@ def delete_record_by_match(openid: str, tx_date: str, kind: str, amount,
 
 def day_records(openid: str, day: str) -> list:
     """某一天的全部记录(旧→新), 含id供删除用"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             "SELECT id, tx_date, type, category, subcategory, amount, note FROM records "
             "WHERE openid=? AND tx_date=? ORDER BY id", (openid, day)).fetchall()
@@ -178,7 +193,7 @@ def day_records(openid: str, day: str) -> list:
 
 def unclassified_records(limit: int = 500) -> list:
     """待AI复核/回填的记录(subcat_src != 'ai'): [(id, category, type)]"""
-    with closing(_conn()) as conn:
+    with _session() as conn:
         rows = conn.execute(
             "SELECT id, category, type FROM records "
             "WHERE subcat_src != 'ai' ORDER BY id LIMIT ?", (limit,)).fetchall()
@@ -187,6 +202,6 @@ def unclassified_records(limit: int = 500) -> list:
 
 def update_record_subcategory(rid: int, subcategory: str, src: str = ""):
     """按记录id回填/修正大类, 同时记录来源(local/ai)"""
-    with _lock, closing(_conn()) as conn:
+    with _lock, _session() as conn:
         conn.execute("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
                      (subcategory, src, rid))
