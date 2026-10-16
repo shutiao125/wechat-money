@@ -54,12 +54,38 @@ def init_db():
             note     TEXT DEFAULT '',
             source   TEXT DEFAULT 'text',     -- text / voice / manual
             created_at TEXT DEFAULT (datetime('now','localtime')))""")
+        # 微信被动回复缓存：跨 uWSGI worker 持久化 MsgId -> XML 回复
+        conn.execute("""CREATE TABLE IF NOT EXISTS wechat_reply_cache(
+            msg_id TEXT PRIMARY KEY,
+            response_xml TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
         # 迁移: 老库补充 subcategory / subcat_src 列
         cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
         if "subcategory" not in cols:
             conn.execute("ALTER TABLE records ADD COLUMN subcategory TEXT DEFAULT ''")
         if "subcat_src" not in cols:
             conn.execute("ALTER TABLE records ADD COLUMN subcat_src TEXT DEFAULT ''")
+
+
+
+def get_wechat_reply(msg_id: str):
+    """读取已完成的微信消息回复；返回 XML 字符串或 None。"""
+    if not msg_id:
+        return None
+    with _session() as conn:
+        row = conn.execute("SELECT response_xml FROM wechat_reply_cache WHERE msg_id=?", (msg_id,)).fetchone()
+    return row["response_xml"] if row else None
+
+
+def save_wechat_reply(msg_id: str, response_xml: str):
+    """保存完整被动回复；幂等更新，保留最近7天缓存。"""
+    if not msg_id or not response_xml or not response_xml.lstrip().startswith("<xml>"):
+        return
+    with _session() as conn:
+        conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
+            ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
+            created_at=datetime('now','localtime')""", (msg_id, response_xml))
+        conn.execute("DELETE FROM wechat_reply_cache WHERE created_at < datetime('now','localtime','-7 days')")
 
 
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
