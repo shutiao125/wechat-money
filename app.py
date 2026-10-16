@@ -929,14 +929,15 @@ def wechat_callback():
         fast_body = fast_body[2:].strip()
     if tokenize_amounts(fast_body) and not any(k in fast_body for k in _FAST_SKIP):
         batch = parse_batch(fast_body)
-        if batch:                                # ≥2笔: 批量秒记
+        if batch:                                # ≥2笔: 批量秒记(一次提交, 减少网络盘落盘次数)
             tx_date = fast_date or datetime.now().strftime("%Y-%m-%d")
             subs = _pick_subcategories([(c, "支出") for _, _, c in batch])
-            lines, total = [], 0.0
-            for (note, amt, cat), (sub, _src) in zip(batch, subs):
-                db.add_record(openid, tx_date, "支出", cat, amt, note, source, sub, _src)
+            rows, lines, total = [], [], 0.0
+            for (note, amt, cat), (sub, src) in zip(batch, subs):
+                rows.append(("支出", cat, amt, note, sub, src))
                 total += amt
                 lines.append(f"  {note} ¥{amt:.2f}")
+            db.add_records_bulk(openid, tx_date, rows, source)
             return wechat.to_text_reply(
                 msg.get("ToUserName", ""), openid,
                 f"💸 已批量记账 {len(batch)}笔, 共 ¥{total:.2f}:\n"

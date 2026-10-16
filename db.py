@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """记账存储: SQLite单文件, 线程安全"""
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
 
 from config import DB_PATH
+
+
+def _caller() -> str:
+    """慢会话打点用: 取第一个db.py之外的调用函数名"""
+    f = sys._getframe(2)
+    while f and f.f_code.co_filename == __file__:
+        f = f.f_back
+    return f.f_code.co_name if f else "?"
 
 
 class _DbLock:
@@ -58,11 +67,12 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=2.0)
     conn.row_factory = sqlite3.Row
     # 部署环境的home是网络盘: 默认的rollback journal每次提交都要建文件+fsync,
-    # 在慢盘上极易卡死几分钟(请求被uWSGI harakiri杀掉)。改用内存日志 +
-    # 关闭同步, 把每次提交的网络I/O降到最低; busy_timeout限制SQLite级等锁
+    # 在慢盘上极易卡死几分钟(请求被uWSGI harakiri杀掉)。这里把每次提交的
+    # 网络I/O降到最低: 日志放内存(MEMORY) + 不同步(OFF) + 临时表放内存。
+    # 代价是进程被强杀时可能丢最后一笔, 但换来的是读写不再卡死整个服务
     try:
         conn.execute("PRAGMA journal_mode=MEMORY")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA synchronous=OFF")
         conn.execute("PRAGMA busy_timeout=2000")
         conn.execute("PRAGMA temp_store=MEMORY")
     except Exception as e:
@@ -78,15 +88,24 @@ def _session():
     网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化;
     锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复"""
     with _lock.hold(2.0):
+        t0 = time.monotonic()
         conn = _conn()          # 建连在锁内: 由 _lock.hold 的finally兜底释放, 不会泄漏
+        t1 = time.monotonic()
         try:
             yield conn
             conn.commit()
+            t2 = time.monotonic()
         except Exception:
             conn.rollback()
+            t2 = time.monotonic()
             raise
         finally:
             conn.close()
+        total = time.monotonic() - t0
+        if total > 1.0:      # 打点定位瓶颈: 建连 vs 语句+提交 (网络盘是主要嫌疑)
+            print(f"[db] ⚠️ 慢会话 {total:.1f}s "
+                  f"(建连{t1 - t0:.1f}s/语句+提交{t2 - t1:.1f}s) 来源:{_caller()}",
+                  flush=True)
 
 
 def init_db():
@@ -152,6 +171,20 @@ def add_record(openid: str, tx_date: str, rtype: str, category: str,
             "subcat_src,amount,note,source) VALUES(?,?,?,?,?,?,?,?,?)",
             (openid, tx_date, rtype, category, subcategory, subcat_src,
              amount, note, source))
+
+
+def add_records_bulk(openid: str, tx_date: str, rows: list, source: str = "text"):
+    """一次事务批量插入多笔, 避免逐条commit
+    (网络盘上每次commit都是一次落盘, 批量合并可明显降低延迟与卡死概率)
+    rows: [(type, category, amount, note, subcategory, subcat_src), ...]"""
+    if not rows:
+        return
+    with _session() as conn:
+        conn.executemany(
+            "INSERT INTO records(openid,tx_date,type,category,subcategory,"
+            "subcat_src,amount,note,source) VALUES(?,?,?,?,?,?,?,?,?)",
+            [(openid, tx_date, rt, cat, sub, src, amt, note, source)
+             for rt, cat, amt, note, sub, src in rows])
 
 
 def _sums(where: str, args: tuple, openid: str) -> dict:
