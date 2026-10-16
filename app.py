@@ -539,6 +539,8 @@ def wechat_callback():
     msg_type = msg.get("MsgType", "")
     print(f"[msg] openid={openid!r} MsgType={msg_type!r} Content={msg.get('Content','')!r}")
     if not _allowed(openid):
+        # 白名单拦截时返回空success(无回复无报错), 打印原因便于排查
+        print(f"[wechat] ⚠️ 白名单拦截: openid={openid!r} 不在 ALLOWED_OPENIDS={ALLOWED_OPENIDS!r}")
         return "success"
 
     # 关注事件
@@ -586,9 +588,9 @@ def wechat_callback():
     today = datetime.now().strftime("%Y-%m-%d")
     if text in ("今日", "今天"):
         t = db.today_stats(openid, today)
-        return wechat.to_text_reply(
-            msg.get("ToUserName", ""), openid,
-            f"📊 今日支出: ¥{t['支出']:.2f}\n📊 今日收入: ¥{t['收入']:.2f}")
+        reply = f"📊 今日支出: ¥{t['支出']:.2f}\n📊 今日收入: ¥{t['收入']:.2f}"
+        print(f"[wechat] 今日回复: {reply!r}")
+        return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
     if text in ("本月", "月报"):
         month = datetime.now().strftime("%Y-%m")
         m = db.month_stats(openid, month)
