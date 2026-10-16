@@ -31,6 +31,13 @@ CF_API_TOKEN  = os.getenv("CF_API_TOKEN", "")  # 敏感凭据, 勿提交git, 请
 CF_MODEL      = os.getenv("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct-fp8-fast")
 
 # ---------- 其他 ----------
+# 数据库后端: 填了 MYSQL_HOST/USER/DB 即用 MySQL(PythonAnywhere 推荐, 本机磁盘写入快);
+# 未配置则回退 SQLite(DB_PATH, 部署在 PythonAnywhere 网络盘上, 写入可能很慢)
+MYSQL_HOST = os.getenv("MYSQL_HOST", "")            # 例: ggglll77.mysql.pythonanywhere-services.com
+MYSQL_USER = os.getenv("MYSQL_USER", "")            # 例: ggglll77 (PA Databases页的账号)
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")    # 敏感: PA Databases页设置/重置的密码
+MYSQL_DB = os.getenv("MYSQL_DB", "")                # 例: ggglll77$default
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 # SQLite文件路径: 相对路径锚定到本项目目录, 避免WSGI启动目录不同而读写到别处的空库
 DB_PATH = os.getenv("LEDGER_DB", "ledger.db")
 if not os.path.isabs(DB_PATH):

@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
-"""记账存储: SQLite单文件, 线程安全"""
-import sqlite3
+"""记账存储: 后端可切换
+- 默认 SQLite 单文件(线程安全)
+- 配置了 MySQL(MYSQL_HOST/USER/DB)则用 MySQL: PythonAnywhere 网络盘上
+  SQLite 写入极慢(实测单次提交5~15秒, 官方也推荐MySQL), MySQL 在本机磁盘,
+  写入毫秒级; 进程内仍用同一把锁串行, 避免并发写冲突(免费账号也限单连接)
+"""
 import sys
 import threading
 import time
 from contextlib import contextmanager
 
-from config import DB_PATH
+from config import DB_PATH, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB, MYSQL_PORT
+
+# MySQL 配置齐全才启用(否则回退 SQLite, 保证未配置时服务不崩)
+_USE_MYSQL = bool(MYSQL_HOST and MYSQL_USER and MYSQL_DB)
 
 
 def _caller() -> str:
@@ -71,7 +78,47 @@ class _DbLock:
 _lock = _DbLock()
 
 
-def _conn() -> sqlite3.Connection:
+class _MyConn:
+    """MySQL连接代理: 把 SQLite 风格的 ? 占位符翻译成 pymysql 的 %s,
+    并保持 row["col"] 字典式访问, 使上层SQL语句无需按后端改写"""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def _tr(self, sql: str) -> str:
+        return sql.replace("?", "%s") if "?" in sql else sql
+
+    def execute(self, sql, args=()):
+        return self._raw.execute(self._tr(sql), args if args else None)
+
+    def executemany(self, sql, seq):
+        return self._raw.executemany(self._tr(sql), list(seq) if seq else [])
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        self._raw.close()
+
+
+def _conn():
+    if _USE_MYSQL:
+        try:
+            import pymysql
+            from pymysql.cursors import DictCursor
+        except ImportError:
+            raise RuntimeError("未安装 pymysql, 请先 pip install pymysql")
+        raw = pymysql.connect(
+            host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASSWORD,
+            database=MYSQL_DB, port=MYSQL_PORT, charset="utf8mb4",
+            cursorclass=DictCursor, connect_timeout=3,
+            read_timeout=8, write_timeout=8, autocommit=False)
+        return _MyConn(raw)
+    # ---- SQLite ----
+    import sqlite3
     conn = sqlite3.connect(DB_PATH, timeout=2.0)
     conn.row_factory = sqlite3.Row
     # 部署环境的home是网络盘: 默认的rollback journal每次提交都要建文件+fsync,
@@ -119,6 +166,29 @@ def _session(wait: bool = True):
 
 def init_db():
     with _session() as conn:
+        if _USE_MYSQL:
+            # MySQL 建表(本机磁盘, 无需PRAGMA优化; 列都齐全, 无需迁移)
+            print(f"[db] MySQL: {MYSQL_USER}@{MYSQL_HOST}/{MYSQL_DB}", flush=True)
+            conn.execute("""CREATE TABLE IF NOT EXISTS records(
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                openid   VARCHAR(64) NOT NULL,
+                tx_date  VARCHAR(10) NOT NULL,           -- YYYY-MM-DD
+                type     VARCHAR(8) NOT NULL,            -- 支出 / 收入
+                category VARCHAR(64) NOT NULL,           -- 分类
+                subcategory VARCHAR(64) DEFAULT '',      -- 大类
+                subcat_src VARCHAR(16) DEFAULT '',       -- 大类来源: ''未归类 / local本地 / ai AI复核
+                amount   DECIMAL(10,2) NOT NULL,
+                note     VARCHAR(128) DEFAULT '',
+                source   VARCHAR(16) DEFAULT 'text',     -- text / voice / manual
+                created_at DATETIME DEFAULT NOW()
+            ) DEFAULT CHARSET=utf8mb4""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS wechat_reply_cache(
+                msg_id VARCHAR(64) PRIMARY KEY,
+                response_xml MEDIUMTEXT NOT NULL,
+                created_at DATETIME DEFAULT NOW()
+            ) DEFAULT CHARSET=utf8mb4""")
+            return
+        # ---- SQLite ----
         # 网络盘上WAL依赖-shm共享内存会卡死; DELETE日志每次提交都要建文件+fsync也很慢。
         # 统一用内存日志(与_conn里的PRAGMA一致), 只保留建表这类必须的落盘
         mode = conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0]
@@ -166,10 +236,19 @@ def save_wechat_reply(msg_id: str, response_xml: str, best_effort: bool = False)
     if not msg_id or not response_xml or not response_xml.lstrip().startswith("<xml>"):
         return
     with _session(wait=not best_effort) as conn:
-        conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
-            ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
-            created_at=datetime('now','localtime')""", (msg_id, response_xml))
-        conn.execute("DELETE FROM wechat_reply_cache WHERE created_at < datetime('now','localtime','-7 days')")
+        if _USE_MYSQL:
+            conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml)
+                VALUES(%s, %s)
+                ON DUPLICATE KEY UPDATE response_xml=VALUES(response_xml),
+                created_at=NOW()""", (msg_id, response_xml))
+            conn.execute("DELETE FROM wechat_reply_cache "
+                         "WHERE created_at < NOW() - INTERVAL 7 DAY")
+        else:
+            conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
+                ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
+                created_at=datetime('now','localtime')""", (msg_id, response_xml))
+            conn.execute("DELETE FROM wechat_reply_cache WHERE created_at < "
+                         "datetime('now','localtime','-7 days')")
 
 
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
