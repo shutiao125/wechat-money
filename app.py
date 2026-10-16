@@ -24,6 +24,22 @@ app = Flask(__name__)
 db.init_db()
 
 
+@app.after_request
+def _cache_wechat_reply(response):
+    """将成功生成的被动XML回复持久化，供微信同一MsgId重试时重放。"""
+    try:
+        if request.path == "/wechat" and request.method == "POST":
+            msg = wechat.parse_xml(request.get_data(cache=True))
+            msg_id = msg.get("MsgId", "")
+            if msg_id and response.status_code == 200:
+                payload = response.get_data(as_text=True)
+                if payload.lstrip().startswith("<xml>"):
+                    db.save_wechat_reply(msg_id, payload)
+    except Exception as e:
+        print(f"[wechat] 回复缓存写入失败: {type(e).__name__}: {e}", flush=True)
+    return response
+
+
 @app.errorhandler(Exception)
 def _on_unhandled(e):
     """兜底: 任何未捕获异常都别让微信侧"无回复"(500会被微信当失败, 用户端什么都看不到)
@@ -79,9 +95,7 @@ def _subcat_worker():
 _backfill_subcategories()
 threading.Thread(target=_subcat_worker, daemon=True).start()
 
-# MsgId去重(微信5秒无响应会重试推送)
-_seen_msgs = set()
-_seen_lock = threading.Lock()
+# MsgId回复缓存存储在SQLite中，跨uWSGI worker有效；不提前在内存标记消息已处理。
 
 # AI分析专用线程池: 用 result(timeout) 强制"总时长"硬超时(requests的read
 # timeout只看两次读间隔, 无法限制总时长, 曾导致被动回复超过微信5秒上限)
@@ -604,10 +618,13 @@ def wechat_callback():
     if msg_type == "event" and msg.get("Event") == "subscribe":
         return wechat.to_text_reply(msg.get("ToUserName", ""), openid, WELCOME)
 
-    # 按MsgId去重
-    if msg.get("MsgId") and _is_duplicate(msg["MsgId"]):
-        print(f"[wechat] ⚠️ 重复消息已忽略 MsgId={msg.get('MsgId')}")
-        return "success"
+    # 微信超时重试时重放上次完整回复；不能只返回 success，否则用户收不到回复。
+    msg_id = msg.get("MsgId", "")
+    if msg_id:
+        cached_reply = db.get_wechat_reply(msg_id)
+        if cached_reply:
+            print(f"[wechat] 重放已缓存回复 MsgId={msg_id}", flush=True)
+            return cached_reply
 
     # 提取文本: 文字消息
     text, source = "", "text"
