@@ -7,6 +7,17 @@ try:
 except Exception:
     pass
 
+# 统一时区为北京时间(Asia/Shanghai)。PythonAnywhere服务器默认UTC(比北京慢8小时),
+# 不设的话 datetime.now() / SQLite datetime('now','localtime') / C库localtime
+# 都会用UTC, 导致"今天"记错日期、今日统计错一天。
+# 必须在任何取时间操作之前设置; config 被所有模块最先import, 故放这里。
+import time as _time
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    _time.tzset()
+except AttributeError:
+    pass                  # Windows 无 tzset, 可忽略
+
 # ---------- 微信测试号配置 (申请地址: https://mp.weixin.qq.com/debug/cgi-bin/sandbox) ----------
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")          # 敏感: 接口配置里的Token, 用环境变量设置
 WECHAT_APPID = os.getenv("WECHAT_APPID", "wx2bc8c88a76b0cf50")               # 测试号信息的appID
