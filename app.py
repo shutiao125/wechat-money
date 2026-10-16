@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from flask import Flask, request
+from werkzeug.exceptions import HTTPException
 
 from config import (WECHAT_TOKEN, ALLOWED_OPENIDS, PUSH_TOKEN,
                     RUN_SCHEDULER, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY)
@@ -21,6 +22,28 @@ from report import (build_daily_report, build_weekly_report,
 
 app = Flask(__name__)
 db.init_db()
+
+
+@app.errorhandler(Exception)
+def _on_unhandled(e):
+    """兜底: 任何未捕获异常都别让微信侧"无回复"(500会被微信当失败, 用户端什么都看不到)
+    记好堆栈, 同时回一条可见提示, 便于定位"""
+    if isinstance(e, HTTPException):
+        return e
+    import traceback
+    traceback.print_exc()
+    print(f"[wechat] ⚠️ 处理异常, 降级回复: {e!r}")
+    try:
+        msg = wechat.parse_xml(request.data)     # request.data 已缓存, 可重复读取
+        openid = msg.get("FromUserName", "")
+        if openid:
+            return wechat.to_text_reply(
+                msg.get("ToUserName", ""), openid,
+                "⚠️ 系统开了会儿小差, 请再发一次~\n"
+                "若反复出现, 把这条消息的时间发给开发者查日志")
+    except Exception:
+        pass
+    return "success"
 
 # ==================== 大类(subcategory)回填 ====================
 def _backfill_subcategories():
@@ -537,7 +560,8 @@ def wechat_callback():
 
     openid = msg.get("FromUserName", "")
     msg_type = msg.get("MsgType", "")
-    print(f"[msg] openid={openid!r} MsgType={msg_type!r} Content={msg.get('Content','')!r}")
+    print(f"[msg] openid={openid!r} MsgType={msg_type!r} Content={msg.get('Content','')!r}",
+          flush=True)
     if not _allowed(openid):
         # 白名单拦截时返回空success(无回复无报错), 打印原因便于排查
         print(f"[wechat] ⚠️ 白名单拦截: openid={openid!r} 不在 ALLOWED_OPENIDS={ALLOWED_OPENIDS!r}")

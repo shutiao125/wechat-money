@@ -31,7 +31,10 @@ CF_API_TOKEN  = os.getenv("CF_API_TOKEN", "")  # 敏感凭据, 勿提交git, 请
 CF_MODEL      = os.getenv("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct-fp8-fast")
 
 # ---------- 其他 ----------
-DB_PATH = os.getenv("LEDGER_DB", "ledger.db")                         # SQLite文件路径
+# SQLite文件路径: 相对路径锚定到本项目目录, 避免WSGI启动目录不同而读写到别处的空库
+DB_PATH = os.getenv("LEDGER_DB", "ledger.db")
+if not os.path.isabs(DB_PATH):
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
 PUSH_TOKEN = os.getenv("PUSH_TOKEN", "")                        # 敏感: 手动触发推送口令, 用环境变量设置
 RUN_SCHEDULER = os.getenv("RUN_SCHEDULER", "1") == "1"                # 内置定时推送开关(本机运行用)
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "21"))                         # 每日推送时间: 点

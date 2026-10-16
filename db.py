@@ -10,7 +10,8 @@ _lock = threading.Lock()
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)   # 等待锁最长10秒, 避免直接抛locked
+    # 等待锁上限压到3秒: 微信被动回复只有5秒窗口, 绝不能在这里卡到5秒以上
+    conn = sqlite3.connect(DB_PATH, timeout=3.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -33,8 +34,11 @@ def _session():
 def init_db():
     with _session() as conn:
         # WAL: 读写并发不互斥, 大幅避免 database is locked
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        conn.execute("PRAGMA busy_timeout=3000")
+        # 启动打点: 真实库路径 + 实际生效的日志模式(WAL在部分网络盘上会退化为delete,
+        # 那就会读写互斥 -> 查询卡住 -> 微信5秒超时无回复, 这里能一眼看出)
+        print(f"[db] DB_PATH={DB_PATH} journal_mode={mode}")
         conn.execute("""CREATE TABLE IF NOT EXISTS records(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             openid   TEXT NOT NULL,
