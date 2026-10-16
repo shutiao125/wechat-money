@@ -9,19 +9,6 @@ import requests
 
 from config import LLM_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL
 
-CATEGORIES = "餐饮/交通/购物/娱乐/居住/医疗/教育/人情/工资/理财/其他"
-
-PROMPT = """你是记账助手。从用户消息中解析出一笔记账, 只输出如下JSON, 不要任何其他内容:
-{{"date":"YYYY-MM-DD","type":"支出|收入","category":"细分类","subcategory":"大类","amount":数字,"note":"简要备注"}}
-
-规则:
-1. "今天"是{today}, "昨天"是{yesterday}; 未提到日期默认今天
-2. category 是用户消费的具体名称(如咖啡/打车/房租/发工资), 不要归并成大分类
-3. subcategory 是消费大类, 只能从 [餐饮/出行/购物/居住/其他] 中选择; 收入类记录 subcategory 填"收入"
-4. amount 为正数, 只保留数字部分; 未提到金额则amount填0
-5. note 用不超过10个字概括消费内容
-6. 收款/收到红包/到账 => type为收入; 其余默认支出"""
-
 # ==================== 大类映射(精简体系) ====================
 # 细分类(用户输入即类别) -> 大类(subcategory), 用于消费统计与AI分析聚合
 # 支出5类 + 收入1类; 本地匹配不到的大类交由 _cf_classify 用AI兜底
@@ -112,43 +99,39 @@ def _cf_chat(system: str, user: str, timeout: float = 4.0,
         return None
 
 
-VALID_SUBS = ("餐饮", "出行", "购物", "居住", "其他", "收入")
-
-
-def _llm_parse(text: str) -> dict | None:
-    today = datetime.date.today()
-    ctx = {"today": str(today), "yesterday": str(today - datetime.timedelta(days=1)),
-           "cats": CATEGORIES}
-    content = _cf_chat(PROMPT.format(**ctx), text, timeout=3.0, max_tokens=300, temperature=0)
-    if not content:
-        raise RuntimeError("CF无返回")
-    # 提取JSON(模型偶尔会带```json包裹)
-    m = re.search(r"\{.*\}", content, re.S)
-    data = json.loads(m.group())
-    sub = (data.get("subcategory") or "").strip()
-    sub = sub if sub in VALID_SUBS else ""
-    return {
-        "date": data.get("date") or str(today),
-        "type": data.get("type", "支出"),
-        "category": data.get("category", "其他"),
-        "subcategory": sub,
-        "amount": round(float(data.get("amount", 0)), 2),
-        "note": data.get("note", text[:20]),
-    }
-
-
 def _regex_parse(text: str) -> dict:
-    """无LLM时的兜底: 只保证金额和日期, 分类按关键词粗略匹配"""
+    """正则兜底(秒级, 不调LLM): 提取金额/日期/收入类型;
+    类别 = 用户输入文字去掉日期、金额和常见语气词(用户输入什么类别就记什么)"""
     today = datetime.date.today()
     d = today - datetime.timedelta(days=1) if "昨天" in text else today
-    m = re.search(r"(\d+(?:\.\d+)?)\s*[块元]", text) or re.search(r"[¥￥](\d+(?:\.\d+)?)", text) \
-        or re.search(r"(\d+(?:\.\d+)?)", text)
-    amount = round(float(m.group(1)), 2) if m else 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[块元]", text) or \
+        re.search(r"[¥￥](\d+(?:\.\d+)?)", text)
+    if not m:
+        nums = re.findall(r"\d+(?:\.\d+)?", text)   # 无单位词时取最后一个数字(金额通常靠后)
+        amount = round(float(nums[-1]), 2) if nums else 0.0
+    else:
+        amount = round(float(m.group(1)), 2)
     rtype = "收入" if any(k in text for k in INCOME_KEYWORDS) else "支出"
-    # 类别直接用用户输入的文字, 不再归类到预设大分类
-    category = text[:20]
-    return {"date": str(d), "type": rtype, "category": category,
-            "subcategory": "", "amount": amount, "note": text[:20]}
+    cat = _clean_category(text)
+    return {"date": str(d), "type": rtype, "category": cat,
+            "subcategory": "", "amount": amount, "note": cat}
+
+
+# 类别清洗: 去掉尾部"花了/花/啦/了"等语气与动词后缀(用户输入什么类别就记什么)
+_CAT_DIRTY = re.compile(
+    r"(花了|花掉|花|用掉|花费|消费|付了|支付|共|合计|左右|上下|啦|哈|哦|啊|了"
+    r"|~|～|！|!|。|，|,|、|\.)+$")
+
+
+def _clean_category(name: str) -> str:
+    """把用户输入整理成干净的类别: 去日期前缀/金额/空格/语气词后缀"""
+    cat = re.sub(r"^(今天|昨天)\s*", "", name)
+    cat = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}[日号]?\s*", "", cat)
+    cat = re.sub(r"^\d{1,2}月\d{1,2}[日号]?\s*", "", cat)
+    cat = re.sub(r"[¥￥]?\d+(?:\.\d+)?\s*[块元票毛]?\s*", "", cat)
+    cat = re.sub(r"\s+", "", cat)
+    cat = _CAT_DIRTY.sub("", cat)
+    return (cat or name)[:20]
 
 
 REPORT_PROMPT = """你是记账助手。以下是用户{month}月的收支统计(JSON):
@@ -206,23 +189,18 @@ def annual_report(year: str, data: dict) -> str | None:
                     timeout=20, max_tokens=700)
 
 
-def parse_record(text: str, use_llm: bool = True) -> dict:
-    """入口: 优先按"名称 金额"取类别(用户输入什么类别就记什么, 如"咖啡6"->咖啡);
-    无法干净拆分时再用LLM/正则兜底; use_llm=False 跳过大模型只用正则
-    subcategory 由调用方统一决定: LLM路径已带回大类(ai), 其余留空由app层AI优先判断"""
+def parse_record(text: str) -> dict:
+    """记账入口(纯本地秒级, 不调LLM): 优先按"名称 金额"拆解
+    (用户输入什么类别就记什么, 如"咖啡6"->咖啡); 拆不开时用正则兜底
+    大类(subcategory)由调用方统一决定: 本地秒判, 后台AI异步复核"""
     items = tokenize_amounts(text)
     if items and len(items) == 1:
         name, amt = items[0]
         today = str(datetime.date.today())
         rtype = "收入" if any(k in name for k in INCOME_KEYWORDS) else "支出"
-        r = {"date": today, "type": rtype, "category": name,
-             "subcategory": "", "amount": amt, "note": name}
-    elif LLM_API_KEY and use_llm:
-        try:
-            r = _llm_parse(text)
-        except Exception as e:
-            print(f"[llm_parser] LLM解析失败, 使用正则兜底: {e}")
-            r = _regex_parse(text)
+        cat = _clean_category(name)
+        r = {"date": today, "type": rtype, "category": cat,
+             "subcategory": "", "amount": amt, "note": cat}
     else:
         r = _regex_parse(text)
     r.setdefault("subcategory", "")

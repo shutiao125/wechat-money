@@ -41,7 +41,7 @@ def _backfill_subcategories():
 
 def _subcat_worker():
     """后台线程: 逐条用AI复核所有未定稿(subcat_src != 'ai')记录的大类,
-    每30秒一批, 不阻塞微信5秒回复"""
+    每8秒一批, 完全在后台执行, 不占用/阻塞微信5秒回复"""
     while True:
         try:
             for r in db.unclassified_records(limit=20):
@@ -50,7 +50,7 @@ def _subcat_worker():
                     db.update_record_subcategory(r["id"], sub, "ai")
         except Exception as e:
             print(f"[subcat] AI复核异常: {e}")
-        time.sleep(30)
+        time.sleep(8)
 
 
 _backfill_subcategories()
@@ -66,41 +66,21 @@ _llm_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm")
 
 
 def _pick_subcategory(name: str, rtype: str, ai_timeout: float = 2.0):
-    """记账时AI优先判断大类: 硬超时2.2s内完成, 超时/失败/未配置 -> 本地关键词兜底;
-    本地也判断不了则暂归"其他"(标local, 后台AI可复核修正)
-    返回 (大类, 来源); 来源: ai=AI判断, local=本地兜底"""
-    try:
-        fut = _llm_pool.submit(_cf_classify, name, rtype, ai_timeout)
-        sub = fut.result(timeout=ai_timeout + 0.2)
-        if sub:
-            return sub, "ai"
-    except Exception as e:
-        print(f"[subcat] AI判断超时/失败({e}), 本地兜底")
+    """记账时本地秒判大类(不等待AI): 关键词命中即返回, 判断不了暂归"其他"
+    (标local, 由后台 _subcat_worker 用AI复核修正)
+    返回 (大类, 来源); 来源: local=本地兜底"""
     sub = classify_local(name, rtype)
-    if sub:
-        return sub, "local"
-    return "其他", "local"
+    return (sub, "local") if sub else ("其他", "local")
 
 
 def _pick_subcategories(pairs):
-    """批量并发AI判断大类: 所有项同时提交, 总硬超时2.2s, 超时/失败本地兜底
+    """批量本地秒判大类(不等待AI): 关键词命中即返回, 判断不了暂归"其他"
+    (标local, 后台AI复核修正)
     pairs: [(name, rtype), ...] -> [(大类, 来源), ...]"""
     if not pairs:
         return []
-    futs = [_llm_pool.submit(_cf_classify, name, rtype, 2.0)
+    return [(classify_local(name, rtype) or "其他", "local")
             for name, rtype in pairs]
-    results, deadline = [], time.monotonic() + 2.2
-    for (name, rtype), fut in zip(pairs, futs):
-        try:
-            remain = deadline - time.monotonic()
-            sub = fut.result(timeout=max(remain, 0.05))
-            if sub:
-                results.append((sub, "ai"))
-                continue
-        except Exception:
-            pass
-        results.append((classify_local(name, rtype) or "其他", "local"))
-    return results
 
 WELCOME = (
     "👋 欢迎使用记账助手!\n"
@@ -516,14 +496,11 @@ AGENT_HANDLERS = {
 }
 
 
-def handle_record(openid: str, text: str, source: str, day: str = "",
-                  use_llm: bool = True) -> str:
-    """同步解析并入库, 返回确认文本(作为被动回复, 未认证订阅号无客服消息接口)
+def handle_record(openid: str, text: str, source: str, day: str = "") -> str:
+    """纯本地秒级解析并入库, 返回确认文本(作为被动回复, 未认证订阅号无客服消息接口)
     day 非空时覆盖解析出的日期(供补记/修改指定日期使用)
-    use_llm=False 时跳过大模型解析只用正则(Agent层已调过LLM时, 避免超5秒)
-    大类判断: LLM解析已带回(subcategory=ai); 快路径由 _pick_subcategory
-    用AI优先判断(硬超时2.2s), 失败才本地兜底"""
-    r = parse_record(text, use_llm=use_llm)
+    全程不等待AI(解析走正则, 大类本地秒判), 大类待后台AI异步复核修正"""
+    r = parse_record(text)
     sub = r.get("subcategory", "") or ""
     if sub:
         src = "ai"
@@ -909,7 +886,7 @@ def wechat_callback():
             msg.get("ToUserName", ""), openid,
             "⏳ AI处理超时了, 请再发一次试试~\n删改账也可直接用命令:\n"
             "  删除9月7日 餐饮 35\n  修改9月7日 餐饮 35 打车 40")
-    reply = handle_record(openid, text, source, use_llm=not agent_attempted)
+    reply = handle_record(openid, text, source)
     return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
 
 
