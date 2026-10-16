@@ -4,3 +4,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# 工作目录中的其他独立项目/个人文件(勿提交到本仓库)
+/AIagent/
+/goods/
+/shutiao/
+/简历项目描述-AI应用岗.md
