@@ -1,19 +1,34 @@
 # -*- coding: utf-8 -*-
-"""记账存储: 后端可切换
-- 默认 SQLite 单文件(线程安全)
-- 配置了 MySQL(MYSQL_HOST/USER/DB)则用 MySQL: PythonAnywhere 网络盘上
-  SQLite 写入极慢(实测单次提交5~15秒, 官方也推荐MySQL), MySQL 在本机磁盘,
-  写入毫秒级; 进程内仍用同一把锁串行, 避免并发写冲突(免费账号也限单连接)
+"""记账存储: 内存SQLite主库 + 后台增量备份到磁盘
+
+背景: PythonAnywhere免费版(2026-01-15后新注册账户)不提供MySQL; 而其网络盘上
+SQLite每次提交实测卡5~15秒, 远超微信5秒被动回复窗口, 曾导致服务反复瘫痪。
+方案: 所有读写走进程内 :memory: 共享缓存库(毫秒级, 微信请求5秒内必回);
+后台线程每DB_BACKUP_INTERVAL秒把内存库在线备份到磁盘 ledger.db;
+启动/进程重启时把磁盘库加载回内存。
+权衡: 进程被强杀或主动Reload时, 最多丢最近一次备份后新写的账(默认30秒)。
+对个人记账可接受; 明显优于"每次提交卡死导致整个服务无响应"。
+注意: 只适用于单进程部署(PythonAnywhere免费版即单worker)。
 """
+import os
+import sqlite3
 import sys
 import threading
 import time
 from contextlib import contextmanager
 
-from config import DB_PATH, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB, MYSQL_PORT
+from config import DB_PATH
 
-# MySQL 配置齐全才启用(否则回退 SQLite, 保证未配置时服务不崩)
-_USE_MYSQL = bool(MYSQL_HOST and MYSQL_USER and MYSQL_DB)
+# 后台备份间隔(秒): 越小越不易丢数据; 网络盘上备份本身也慢, 30秒较平衡
+DB_BACKUP_INTERVAL = int(os.getenv("DB_BACKUP_INTERVAL", "30"))
+
+# 共享缓存内存库URI: 主连接读写 + 备份连接在线备份, 互不阻塞
+_MEM_URI = "file:ledger_mem?mode=memory&cache=shared"
+
+_mem_conn = None            # 主连接(进程内由 _lock 串行)
+_init_lock = threading.Lock()
+_backup_thread = None
+_stop_backup = False
 
 
 def _caller() -> str:
@@ -34,10 +49,9 @@ class _DbLock:
     """进程内串行锁: 等锁超时 + 卡死自愈 + 持有者可追溯
 
     正常时所有DB读写串行, 后来者最多等 timeout 秒;
-    若持有者超过 STUCK_TTL 仍未释放(网络盘I/O卡住/建连卡住), 后来者会
-    放弃该持有者继续执行, 避免"一个卡住的调用让整个服务瘫到uWSGI harakiri"。
-    真实文件访问仍由SQLite自身锁兜底, 抢占后最坏是报 database is locked,
-    由调用方降级回复(远好过整个服务10分钟无响应)。"""
+    若持有者超过 STUCK_TTL 仍未释放(内存库操作理论上不会, 防御性保留),
+    后来者会放弃该持有者继续执行, 避免一个卡住的调用让整个服务瘫痪。
+    内存库操作都是毫秒级, 等锁超时几乎不会发生。"""
 
     STUCK_TTL = 15.0
 
@@ -78,147 +92,116 @@ class _DbLock:
 _lock = _DbLock()
 
 
-class _MyConn:
-    """MySQL连接代理: 把 SQLite 风格的 ? 占位符翻译成 pymysql 的 %s,
-    并保持 row["col"] 字典式访问, 使上层SQL语句无需按后端改写"""
-
-    def __init__(self, raw):
-        self._raw = raw
-
-    def _tr(self, sql: str) -> str:
-        return sql.replace("?", "%s") if "?" in sql else sql
-
-    def execute(self, sql, args=()):
-        return self._raw.execute(self._tr(sql), args if args else None)
-
-    def executemany(self, sql, seq):
-        return self._raw.executemany(self._tr(sql), list(seq) if seq else [])
-
-    def commit(self):
-        self._raw.commit()
-
-    def rollback(self):
-        self._raw.rollback()
-
-    def close(self):
-        self._raw.close()
-
-
-def _conn():
-    if _USE_MYSQL:
+def _load_disk_into(conn):
+    """启动/重启时: 磁盘库存在则加载进内存连接"""
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        src = sqlite3.connect(DB_PATH)
         try:
-            import pymysql
-            from pymysql.cursors import DictCursor
-        except ImportError:
-            raise RuntimeError("未安装 pymysql, 请先 pip install pymysql")
-        raw = pymysql.connect(
-            host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASSWORD,
-            database=MYSQL_DB, port=MYSQL_PORT, charset="utf8mb4",
-            cursorclass=DictCursor, connect_timeout=3,
-            read_timeout=8, write_timeout=8, autocommit=False)
-        return _MyConn(raw)
-    # ---- SQLite ----
-    import sqlite3
-    conn = sqlite3.connect(DB_PATH, timeout=2.0)
-    conn.row_factory = sqlite3.Row
-    # 部署环境的home是网络盘: 默认的rollback journal每次提交都要建文件+fsync,
-    # 在慢盘上极易卡死几分钟(请求被uWSGI harakiri杀掉)。这里把每次提交的
-    # 网络I/O降到最低: 日志放内存(MEMORY) + 不同步(OFF) + 临时表放内存。
-    # 代价是进程被强杀时可能丢最后一笔, 但换来的是读写不再卡死整个服务
+            src.backup(conn)
+        finally:
+            src.close()
+        print(f"[db] 已从磁盘加载 {DB_PATH}", flush=True)
+
+
+def _init_schema(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS records(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        openid   TEXT NOT NULL,
+        tx_date  TEXT NOT NULL,           -- YYYY-MM-DD
+        type     TEXT NOT NULL,           -- 支出 / 收入
+        category TEXT NOT NULL,           -- 分类
+        subcategory TEXT DEFAULT '',      -- 大类
+        subcat_src TEXT DEFAULT '',       -- 大类来源: ''未归类 / local本地 / ai AI复核
+        amount   REAL NOT NULL,
+        note     TEXT DEFAULT '',
+        source   TEXT DEFAULT 'text',     -- text / voice / manual
+        created_at TEXT DEFAULT (datetime('now','localtime')))""")
+    # 微信被动回复缓存: 跨进程重启后仍可重放 MsgId -> XML 回复
+    conn.execute("""CREATE TABLE IF NOT EXISTS wechat_reply_cache(
+        msg_id TEXT PRIMARY KEY,
+        response_xml TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
+    # 老库补充 subcategory / subcat_src 列
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
+    if "subcategory" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN subcategory TEXT DEFAULT ''")
+    if "subcat_src" not in cols:
+        conn.execute("ALTER TABLE records ADD COLUMN subcat_src TEXT DEFAULT ''")
+
+
+def init_db():
+    """初始化: 建内存库 + 加载磁盘数据 + 建表(幂等)。
+    备份线程不在这里启动(master进程只负责fork, 不处理请求,
+    避免master与worker同时写磁盘冲突); 由 _ensure_backup 在worker内启动"""
+    global _mem_conn
+    with _init_lock:
+        if _mem_conn is not None:
+            return
+        conn = sqlite3.connect(_MEM_URI, uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _load_disk_into(conn)
+        _init_schema(conn)
+        _mem_conn = conn
+        print(f"[db] 内存库就绪(备份间隔{DB_BACKUP_INTERVAL}s -> {DB_PATH})", flush=True)
+
+
+def _ensure_backup():
+    """确保后台备份线程已启动。fork后线程不会复制到worker, 每次会话入口检查,
+    未启动则补启动(只会在worker里生效, 因为只有worker会处理请求)"""
+    global _backup_thread
+    if _backup_thread is not None and _backup_thread.is_alive():
+        return
+    with _init_lock:
+        if _backup_thread is not None and _backup_thread.is_alive():
+            return
+        _backup_thread = threading.Thread(target=_backup_loop, daemon=True,
+                                          name="db-backup")
+        _backup_thread.start()
+
+
+def _backup_loop():
+    while not _stop_backup:
+        time.sleep(DB_BACKUP_INTERVAL)
+        try:
+            _backup_once()
+        except Exception as e:
+            print(f"[db] ⚠️ 后台备份失败(下次重试): {e}", flush=True)
+
+
+def _backup_once():
+    """在线备份: 独立连接打开共享缓存内存库 -> 备份到磁盘文件。
+    备份期间主连接读写不阻塞(backup只短暂持有源库读锁, 页写入慢在磁盘侧)"""
+    if _mem_conn is None:
+        return
+    t0 = time.monotonic()
+    src = sqlite3.connect(_MEM_URI, uri=True)
+    disk = sqlite3.connect(DB_PATH)
     try:
-        conn.execute("PRAGMA journal_mode=MEMORY")
-        conn.execute("PRAGMA synchronous=OFF")
-        conn.execute("PRAGMA busy_timeout=2000")
-        conn.execute("PRAGMA temp_store=MEMORY")
-    except Exception as e:
-        conn.close()
-        raise RuntimeError(f"数据库初始化失败: {e}")
-    return conn
+        src.backup(disk)
+    finally:
+        disk.close()
+        src.close()
+    print(f"[db] 已备份 {DB_PATH} ({time.monotonic()-t0:.1f}s)", flush=True)
 
 
 @contextmanager
 def _session(wait: bool = True):
-    """连接会话: 进程内串行(带锁超时/自愈) + 正常结束提交, 异常回滚, 无论成败都关闭连接
-    (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)
-    网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化;
-    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复
+    """内存库会话: 进程内串行(带锁超时/自愈) + 正常结束提交, 异常回滚
+    所有操作都是内存级, 毫秒返回, 微信5秒窗口内必然完成
     wait=False: 供后台写使用, 锁被占用时立即放弃而非排队"""
+    _ensure_backup()          # 惰性启动备份线程(worker内首次请求触发)
     with _lock.hold(2.0, wait=wait):
         t0 = time.monotonic()
-        conn = _conn()          # 建连在锁内: 由 _lock.hold 的finally兜底释放, 不会泄漏
-        t1 = time.monotonic()
+        conn = _mem_conn
         try:
             yield conn
             conn.commit()
-            t2 = time.monotonic()
         except Exception:
             conn.rollback()
-            t2 = time.monotonic()
             raise
-        finally:
-            conn.close()
         total = time.monotonic() - t0
-        if total > 1.0:      # 打点定位瓶颈: 建连 vs 语句+提交 (网络盘是主要嫌疑)
-            print(f"[db] ⚠️ 慢会话 {total:.1f}s "
-                  f"(建连{t1 - t0:.1f}s/语句+提交{t2 - t1:.1f}s) 来源:{_caller()}",
-                  flush=True)
-
-
-def init_db():
-    with _session() as conn:
-        if _USE_MYSQL:
-            # MySQL 建表(本机磁盘, 无需PRAGMA优化; 列都齐全, 无需迁移)
-            print(f"[db] MySQL: {MYSQL_USER}@{MYSQL_HOST}/{MYSQL_DB}", flush=True)
-            conn.execute("""CREATE TABLE IF NOT EXISTS records(
-                id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                openid   VARCHAR(64) NOT NULL,
-                tx_date  VARCHAR(10) NOT NULL,           -- YYYY-MM-DD
-                type     VARCHAR(8) NOT NULL,            -- 支出 / 收入
-                category VARCHAR(64) NOT NULL,           -- 分类
-                subcategory VARCHAR(64) DEFAULT '',      -- 大类
-                subcat_src VARCHAR(16) DEFAULT '',       -- 大类来源: ''未归类 / local本地 / ai AI复核
-                amount   DECIMAL(10,2) NOT NULL,
-                note     VARCHAR(128) DEFAULT '',
-                source   VARCHAR(16) DEFAULT 'text',     -- text / voice / manual
-                created_at DATETIME DEFAULT NOW()
-            ) DEFAULT CHARSET=utf8mb4""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS wechat_reply_cache(
-                msg_id VARCHAR(64) PRIMARY KEY,
-                response_xml MEDIUMTEXT NOT NULL,
-                created_at DATETIME DEFAULT NOW()
-            ) DEFAULT CHARSET=utf8mb4""")
-            return
-        # ---- SQLite ----
-        # 网络盘上WAL依赖-shm共享内存会卡死; DELETE日志每次提交都要建文件+fsync也很慢。
-        # 统一用内存日志(与_conn里的PRAGMA一致), 只保留建表这类必须的落盘
-        mode = conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0]
-        conn.execute("PRAGMA busy_timeout=2000")
-        # 启动打点: 真实库路径 + 实际生效的日志模式(应为memory)
-        print(f"[db] DB_PATH={DB_PATH} journal_mode={mode}")
-        conn.execute("""CREATE TABLE IF NOT EXISTS records(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            openid   TEXT NOT NULL,
-            tx_date  TEXT NOT NULL,           -- YYYY-MM-DD
-            type     TEXT NOT NULL,           -- 支出 / 收入
-            category TEXT NOT NULL,           -- 分类
-            subcategory TEXT DEFAULT '',      -- 大类
-            subcat_src TEXT DEFAULT '',       -- 大类来源: ''未归类 / local本地 / ai AI复核
-            amount   REAL NOT NULL,
-            note     TEXT DEFAULT '',
-            source   TEXT DEFAULT 'text',     -- text / voice / manual
-            created_at TEXT DEFAULT (datetime('now','localtime')))""")
-        # 微信被动回复缓存：跨 uWSGI worker 持久化 MsgId -> XML 回复
-        conn.execute("""CREATE TABLE IF NOT EXISTS wechat_reply_cache(
-            msg_id TEXT PRIMARY KEY,
-            response_xml TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
-        # 迁移: 老库补充 subcategory / subcat_src 列
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
-        if "subcategory" not in cols:
-            conn.execute("ALTER TABLE records ADD COLUMN subcategory TEXT DEFAULT ''")
-        if "subcat_src" not in cols:
-            conn.execute("ALTER TABLE records ADD COLUMN subcat_src TEXT DEFAULT ''")
-
+        if total > 1.0:       # 防御性打点: 内存操作正常远小于1s
+            print(f"[db] ⚠️ 慢会话 {total:.1f}s 来源:{_caller()}", flush=True)
 
 
 def get_wechat_reply(msg_id: str):
@@ -236,19 +219,11 @@ def save_wechat_reply(msg_id: str, response_xml: str, best_effort: bool = False)
     if not msg_id or not response_xml or not response_xml.lstrip().startswith("<xml>"):
         return
     with _session(wait=not best_effort) as conn:
-        if _USE_MYSQL:
-            conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml)
-                VALUES(%s, %s)
-                ON DUPLICATE KEY UPDATE response_xml=VALUES(response_xml),
-                created_at=NOW()""", (msg_id, response_xml))
-            conn.execute("DELETE FROM wechat_reply_cache "
-                         "WHERE created_at < NOW() - INTERVAL 7 DAY")
-        else:
-            conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
-                ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
-                created_at=datetime('now','localtime')""", (msg_id, response_xml))
-            conn.execute("DELETE FROM wechat_reply_cache WHERE created_at < "
-                         "datetime('now','localtime','-7 days')")
+        conn.execute("""INSERT INTO wechat_reply_cache(msg_id, response_xml) VALUES(?, ?)
+            ON CONFLICT(msg_id) DO UPDATE SET response_xml=excluded.response_xml,
+            created_at=datetime('now','localtime')""", (msg_id, response_xml))
+        conn.execute("DELETE FROM wechat_reply_cache WHERE created_at < "
+                     "datetime('now','localtime','-7 days')")
 
 
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
@@ -263,9 +238,7 @@ def add_record(openid: str, tx_date: str, rtype: str, category: str,
 
 
 def add_records_bulk(openid: str, tx_date: str, rows: list, source: str = "text"):
-    """一次事务批量插入多笔, 避免逐条commit
-    (网络盘上每次commit都是一次落盘, 批量合并可明显降低延迟与卡死概率)
-    rows: [(type, category, amount, note, subcategory, subcat_src), ...]"""
+    """一次事务批量插入多笔"""
     if not rows:
         return
     with _session() as conn:
@@ -419,7 +392,6 @@ def update_record_subcategory(rid: int, subcategory: str, src: str = ""):
 
 def update_subcategories_bulk(updates: list):
     """批量回填/修正大类, 单次事务提交
-    (网络盘上每次commit都有落盘开销, 合并提交可把N次I/O降为1次)
     updates: [(id, subcategory, src), ...]"""
     if not updates:
         return
