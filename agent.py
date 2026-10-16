@@ -4,11 +4,10 @@
 自主决定调用哪个工具并抽取参数, 用于理解正则快路径覆盖不到的自由表达。
 未配置凭据/超时/未调用工具时返回 None, 调用方转正则兜底, 保证可用性。"""
 import json
-from datetime import date
 
 import requests
 
-from config import CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL
+from config import CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL, now
 
 AGENT_TIMEOUT = 3.5   # 单次路由硬超时(秒): 微信被动回复限时5秒, 必须留出执行与回复余量
 
@@ -124,7 +123,7 @@ def route(text: str):
     url = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
            f"/ai/run/{CF_MODEL}")
     body = {"messages": [{"role": "system",
-                          "content": SYSTEM_TMPL.format(today=date.today())},
+                          "content": SYSTEM_TMPL.format(today=now().date())},
                          {"role": "user", "content": text}],
             "tools": TOOLS, "tool_choice": "auto",
             "max_tokens": 300, "temperature": 0}

@@ -7,7 +7,7 @@ import datetime
 
 import requests
 
-from config import LLM_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL
+from config import LLM_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL, now
 
 # ==================== 大类映射(精简体系) ====================
 # 细分类(用户输入即类别) -> 大类(subcategory), 用于消费统计与AI分析聚合
@@ -102,7 +102,7 @@ def _cf_chat(system: str, user: str, timeout: float = 4.0,
 def _regex_parse(text: str) -> dict:
     """正则兜底(秒级, 不调LLM): 提取金额/日期/收入类型;
     类别 = 用户输入文字去掉日期、金额和常见语气词(用户输入什么类别就记什么)"""
-    today = datetime.date.today()
+    today = now().date()
     d = today - datetime.timedelta(days=1) if "昨天" in text else today
     m = re.search(r"(\d+(?:\.\d+)?)\s*[块元]", text) or \
         re.search(r"[¥￥](\d+(?:\.\d+)?)", text)
@@ -196,7 +196,7 @@ def parse_record(text: str) -> dict:
     items = tokenize_amounts(text)
     if items and len(items) == 1:
         name, amt = items[0]
-        today = str(datetime.date.today())
+        today = str(now().date())
         rtype = "收入" if any(k in name for k in INCOME_KEYWORDS) else "支出"
         cat = _clean_category(name)
         r = {"date": today, "type": rtype, "category": cat,

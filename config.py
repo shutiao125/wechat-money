@@ -18,6 +18,27 @@ try:
 except AttributeError:
     pass                  # Windows 无 tzset, 可忽略
 
+from datetime import datetime as _datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:       # Python<3.9 无 zoneinfo, 退回依赖上面设置好的TZ
+    ZoneInfo = None
+
+
+def now() -> _datetime:
+    """当前北京时间(UTC+8)的 aware datetime。
+
+    服务器(如PythonAnywhere)默认UTC, 光设 TZ 环境变量在 uWSGI/某些部署下
+    可能不生效, 导致"今天/昨天/本月"错一天。这里显式用 zoneinfo 取北京
+    时间, 业务代码统一调用本函数, 不直接使用 datetime.now()/date.today()。
+    """
+    if ZoneInfo is not None:
+        try:
+            return _datetime.now(ZoneInfo("Asia/Shanghai"))
+        except Exception:
+            pass
+    return _datetime.now()
+
 # ---------- 微信测试号配置 (申请地址: https://mp.weixin.qq.com/debug/cgi-bin/sandbox) ----------
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")          # 敏感: 接口配置里的Token, 用环境变量设置
 WECHAT_APPID = os.getenv("WECHAT_APPID", "wx2bc8c88a76b0cf50")               # 测试号信息的appID

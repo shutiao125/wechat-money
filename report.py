@@ -3,13 +3,13 @@
 import datetime
 
 import db
-from config import DAILY_TEMPLATE_ID, LLM_API_KEY
+from config import DAILY_TEMPLATE_ID, LLM_API_KEY, now
 from llm_parser import ai_report, annual_report
 from wechat import send_custom_text, send_template, send_mass_text
 
 
 def build_daily_report(openid: str) -> str:
-    today = datetime.date.today()
+    today = now().date()
     month = today.strftime("%Y-%m")
 
     t = db.today_stats(openid, str(today))
@@ -32,7 +32,7 @@ def build_daily_report(openid: str) -> str:
 
 def _week_range(today: datetime.date = None):
     """返回本周(周一~周日)的 (起 YYYY-MM-DD, 止 YYYY-MM-DD)"""
-    today = today or datetime.date.today()
+    today = today or now().date()
     start = today - datetime.timedelta(days=today.weekday())   # 周一=0
     end = start + datetime.timedelta(days=6)
     return start, end
@@ -89,7 +89,7 @@ def build_annual_report(openid: str, year: int) -> str:
 
 def push_annual(openid: str, year: int = None):
     """推送年度报告: 默认今年, 配置了LLM则生成AI年度总结, 否则纯文本"""
-    year = year or datetime.date.today().year
+    year = year or now().date().year
     text, s, cats, months, top, top_month = build_annual_report(openid, year)
     # AI增强: 有任意收支记录才调大模型
     if LLM_API_KEY and (s["支出"] or s["收入"]):
@@ -130,7 +130,7 @@ def push_weekly(openid: str):
 
 def push_daily(openid: str):
     """推送到微信: 配置了模板ID用模板消息, 否则用群发文本(个人订阅号每天1次)"""
-    today = datetime.date.today()
+    today = now().date()
     t = db.today_stats(openid, str(today))
     m = db.month_stats(openid, today.strftime("%Y-%m"))
     cats = db.month_by_category(openid, month:=today.strftime("%Y-%m"))

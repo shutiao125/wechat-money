@@ -12,7 +12,7 @@ from flask import Flask, request
 from werkzeug.exceptions import HTTPException
 
 from config import (WECHAT_TOKEN, ALLOWED_OPENIDS, PUSH_TOKEN,
-                    RUN_SCHEDULER, SUBCAT_AI, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY)
+                    RUN_SCHEDULER, SUBCAT_AI, PUSH_HOUR, PUSH_MINUTE, LLM_API_KEY, now)
 import wechat
 import db
 import agent
@@ -245,11 +245,11 @@ def _strip_date(s: str):
     m = re.match(r"^(?P<rel>今天|昨天)", s)
     if m:
         back = 1 if m.group("rel") == "昨天" else 0
-        day = (datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d")
+        day = (now() - timedelta(days=back)).strftime("%Y-%m-%d")
         return day, s[m.end():].strip()
     m = re.match(r"^(?:(?P<y>\d{4})年)?(?P<m>\d{1,2})月(?P<d>\d{1,2})[日号]", s)
     if m:
-        year = int(m.group("y")) if m.group("y") else datetime.now().year
+        year = int(m.group("y")) if m.group("y") else now().year
         try:
             day = f"{year}-{int(m.group('m')):02d}-{int(m.group('d')):02d}"
             return day, s[m.end():].strip()
@@ -274,7 +274,7 @@ def _cat_disp(r):
 def _analysis_data(openid: str, period: str):
     """统计指定周期的收支供AI分析, period为 本月/上月/本周/上周/今年/去年
     返回 (展示标题, 周期标签, data字典); data含 expense/income/balance/分类支出/上期支出/上期收入"""
-    now = datetime.now()
+    now = now()
     if period in ("本月", "上月"):
         month = now.strftime("%Y-%m") if period == "本月" else _prev_month(now)
         stats = db.month_stats(openid, month)
@@ -372,8 +372,8 @@ def _income_cat(cat: str) -> bool:
 
 
 def _agent_record(openid: str, args: dict, source: str, text: str = "") -> str:
-    day = _norm_date(args.get("date"), datetime.now().strftime("%Y-%m-%d")) \
-        or datetime.now().strftime("%Y-%m-%d")
+    day = _norm_date(args.get("date"), now().strftime("%Y-%m-%d")) \
+        or now().strftime("%Y-%m-%d")
     items = args.get("items")
     if not isinstance(items, list) or not items:
         raise ValueError("无有效账目条目")
@@ -405,7 +405,7 @@ def _agent_record(openid: str, args: dict, source: str, text: str = "") -> str:
 
 
 def _agent_delete(openid: str, args: dict, source: str, text: str = "") -> str:
-    day = _norm_date(args.get("date"), datetime.now().strftime("%Y-%m-%d"))
+    day = _norm_date(args.get("date"), now().strftime("%Y-%m-%d"))
     items = args.get("items")
     pairs = []
     if isinstance(items, list):
@@ -506,7 +506,7 @@ def _agent_query(openid: str, args: dict, source: str, text: str = "") -> str:
     if period not in ("today", "yesterday", "this_month", "recent", "date",
                       "本周", "上周", "今年", "去年"):
         period = _period_from_text(text) or period
-    now = datetime.now()
+    now = now()
     if period in ("本周", "上周"):
         base = now - timedelta(weeks=1) if period == "上周" else now
         start = base - timedelta(days=base.weekday())
@@ -714,14 +714,14 @@ def wechat_callback():
                                         "❌ 日期无效, 示例: 补记20250902 午饭30块")
 
     # 快捷命令: 只查数据库, 同步回复(远快于5秒限制)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now().strftime("%Y-%m-%d")
     if text in ("今日", "今天"):
         t = db.today_stats(openid, today)
         reply = f"📊 今日支出: ¥{t['支出']:.2f}\n📊 今日收入: ¥{t['收入']:.2f}"
         print(f"[wechat] 今日回复: {reply!r}")
         return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
     if text in ("本月", "月报"):
-        month = datetime.now().strftime("%Y-%m")
+        month = now().strftime("%Y-%m")
         m = db.month_stats(openid, month)
         cats = db.month_by_category(openid, month)
         top = "、".join(f"{c} ¥{v}" for c, v in cats[:5]) if cats else "暂无"
@@ -742,17 +742,17 @@ def wechat_callback():
             "📋 最近5笔:\n" + "\n".join(lines))
     # 周报: 仅每周日可查询
     if text in ("周报", "本周"):
-        if datetime.now().weekday() != 6:     # weekday(): 周一=0 ... 周日=6
+        if now().weekday() != 6:     # weekday(): 周一=0 ... 周日=6
             return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
                                         "🕐 周报仅每周日可查询, 到时再发「周报」~")
         return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
                                     build_weekly_report(openid))
     # 年报: 仅每年12月31日可查询(查询当年)
     if text in ("年报", "今年"):
-        if datetime.now().month != 12 or datetime.now().day != 31:
+        if now().month != 12 or now().day != 31:
             return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
                                         "🕐 年报仅每年12月31日可查询, 到时再发「年报」~")
-        year = datetime.now().year
+        year = now().year
         text_r, s, cats, months, top, top_month = build_annual_report(openid, year)
         if LLM_API_KEY and (s["支出"] or s["收入"]):
             bal = round(s["收入"] - s["支出"], 2)
@@ -768,7 +768,7 @@ def wechat_callback():
     # 查某天的账: 查9月5日(默认今年) / 查2025年9月5日
     m_q = re.match(r"^查\s*(?:(\d{4})年)?\s*(\d{1,2})月(\d{1,2})[日号]$", text)
     if m_q:
-        year = int(m_q.group(1)) if m_q.group(1) else datetime.now().year
+        year = int(m_q.group(1)) if m_q.group(1) else now().year
         try:
             day = f"{year}-{int(m_q.group(2)):02d}-{int(m_q.group(3)):02d}"
         except ValueError:
@@ -791,7 +791,7 @@ def wechat_callback():
     m_bu = re.match(r"^补记\s*(?:(\d{4})年)?\s*(\d{1,2})月(\d{1,2})[日号]\s*(.+)$", text) or \
            re.match(r"^补记\s*(?:(\d{4})-)?(\d{1,2})-(\d{1,2})\s+(.+)$", text)
     if m_bu:
-        year = int(m_bu.group(1)) if m_bu.group(1) else datetime.now().year
+        year = int(m_bu.group(1)) if m_bu.group(1) else now().year
         try:
             day = f"{year}-{int(m_bu.group(2)):02d}-{int(m_bu.group(3)):02d}"
         except ValueError:
@@ -819,11 +819,11 @@ def wechat_callback():
     if m_mod:
         if m_mod.group("rel"):
             back = 1 if m_mod.group("rel") == "昨天" else 0
-            old_day = (datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d")
+            old_day = (now() - timedelta(days=back)).strftime("%Y-%m-%d")
         else:
             try:
                 if m_mod.group("m"):
-                    year = int(m_mod.group("y")) if m_mod.group("y") else datetime.now().year
+                    year = int(m_mod.group("y")) if m_mod.group("y") else now().year
                     month, day = int(m_mod.group("m")), int(m_mod.group("d"))
                 else:
                     year = int(m_mod.group("y2"))
@@ -873,16 +873,16 @@ def wechat_callback():
     if m_del:
         if m_del.group("rel"):                       # 今天/昨天
             back = 1 if m_del.group("rel") == "昨天" else 0
-            day_s = (datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d")
+            day_s = (now() - timedelta(days=back)).strftime("%Y-%m-%d")
         elif m_del.group("m") or m_del.group("y"):   # M月D日 / YYYY年M月D日
-            year = int(m_del.group("y")) if m_del.group("y") else datetime.now().year
+            year = int(m_del.group("y")) if m_del.group("y") else now().year
             month, day = int(m_del.group("m")), int(m_del.group("d"))
             day_s = f"{year}-{month:02d}-{day:02d}"
         elif m_del.group("y2"):                      # YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD
             month, day = int(m_del.group("m2")), int(m_del.group("d2"))
             day_s = f"{int(m_del.group('y2'))}-{month:02d}-{day:02d}"
         else:                                        # 未写日期, 默认删除今天
-            day_s = datetime.now().strftime("%Y-%m-%d")
+            day_s = now().strftime("%Y-%m-%d")
         try:
             datetime.strptime(day_s, "%Y-%m-%d")     # 校验日期合法(如2月30日会抛错)
         except ValueError:
@@ -951,15 +951,15 @@ def wechat_callback():
                   "帮我", "请帮", "记一下", "记一笔", "删除", "删掉")
     fast_date, fast_body = None, text
     if fast_body.startswith("昨天"):
-        fast_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        fast_date = (now() - timedelta(days=1)).strftime("%Y-%m-%d")
         fast_body = fast_body[2:].strip()
     elif fast_body.startswith("今天"):
-        fast_date = datetime.now().strftime("%Y-%m-%d")
+        fast_date = now().strftime("%Y-%m-%d")
         fast_body = fast_body[2:].strip()
     if tokenize_amounts(fast_body) and not any(k in fast_body for k in _FAST_SKIP):
         batch = parse_batch(fast_body)
         if batch:                                # ≥2笔: 批量秒记(一次提交, 减少网络盘落盘次数)
-            tx_date = fast_date or datetime.now().strftime("%Y-%m-%d")
+            tx_date = fast_date or now().strftime("%Y-%m-%d")
             subs = _pick_subcategories([(c, "支出") for _, _, c in batch])
             rows, lines, total = [], [], 0.0
             for (note, amt, cat), (sub, src) in zip(batch, subs):
