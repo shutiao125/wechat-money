@@ -78,15 +78,30 @@ def _backfill_subcategories():
     print(f"[subcat] 启动本地回填 {n}/{len(rows)} 条, 其余留待AI复核")
 
 
+# 后台AI复核专用单线程池: 对每条记录用 result(timeout) 强制"总时长"硬超时,
+# 防止 _cf_classify 网络请求挂起时拖住线程; 配合db锁2秒超时, 后台线程再卡
+# 也不会阻塞微信请求(曾因网络盘I/O挂起持锁导致"今日"卡到uWSGI harakiri强杀)
+_subcat_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="subcat")
+
+
 def _subcat_worker():
     """后台线程: 逐条用AI复核所有未定稿(subcat_src != 'ai')记录的大类,
-    每8秒一批, 完全在后台执行, 不占用/阻塞微信5秒回复"""
+    每8秒一批, 完全在后台执行, 不占用/阻塞微信5秒回复;
+    单条复核总时长≤2秒, 数据库读写各有2秒锁超时保护, 绝不影响微信请求"""
     while True:
         try:
-            for r in db.unclassified_records(limit=20):
-                sub = _cf_classify(r["category"], r["type"])
+            for r in db.unclassified_records(limit=10):
+                try:
+                    fut = _subcat_pool.submit(_cf_classify, r["category"], r["type"])
+                    sub = fut.result(timeout=2.0)   # 单条总时长硬上限
+                except Exception as e:
+                    print(f"[subcat] 单条复核超时/失败: {e}")
+                    sub = None
                 if sub:
-                    db.update_record_subcategory(r["id"], sub, "ai")
+                    try:
+                        db.update_record_subcategory(r["id"], sub, "ai")
+                    except Exception as e:
+                        print(f"[subcat] 写回失败: {e}")
         except Exception as e:
             print(f"[subcat] AI复核异常: {e}")
         time.sleep(8)

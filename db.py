@@ -18,19 +18,23 @@ def _conn() -> sqlite3.Connection:
 
 @contextmanager
 def _session():
-    """连接会话: 进程内串行 + 正常结束提交, 异常回滚, 无论成败都关闭连接
+    """连接会话: 进程内串行(带2秒锁超时) + 正常结束提交, 异常回滚, 无论成败都关闭连接
     (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)
-    网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化"""
-    with _lock:
-        conn = _conn()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化;
+    锁最多等2秒(微信被动回复只有5秒窗口), 超时立即抛错由调用方降级回复,
+    避免被后台线程持锁卡住后无限等待直到uWSGI harakiri强杀"""
+    if not _lock.acquire(timeout=2.0):
+        raise TimeoutError("数据库忙, 请稍后重试")
+    conn = _conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+        _lock.release()
 
 
 def init_db():
