@@ -549,6 +549,7 @@ def wechat_callback():
 
     # 按MsgId去重
     if msg.get("MsgId") and _is_duplicate(msg["MsgId"]):
+        print(f"[wechat] ⚠️ 重复消息已忽略 MsgId={msg.get('MsgId')}")
         return "success"
 
     # 提取文本: 文字消息
@@ -564,6 +565,7 @@ def wechat_callback():
         return "success"
 
     if not text:
+        print(f"[wechat] ⚠️ 空文本消息忽略: Content={msg.get('Content','')!r}")
         return "success"
 
     # 紧凑日期规范化: 20250902/2025920 -> 2025年09月02日 (供查/补记/删除命令使用)
