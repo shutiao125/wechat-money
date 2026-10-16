@@ -923,7 +923,7 @@ def push_daily_endpoint():
     """手动/外部定时触发每日推送: /push/daily?token=xxx"""
     if request.args.get("token") != PUSH_TOKEN:
         return "forbidden", 403
-    with db._conn() as conn:
+    with db._session() as conn:
         openids = [r["openid"] for r in
                    conn.execute("SELECT DISTINCT openid FROM records")]
     results = {}
@@ -941,7 +941,7 @@ def push_weekly_endpoint():
     """手动/外部定时触发周报推送: /push/weekly?token=xxx"""
     if request.args.get("token") != PUSH_TOKEN:
         return "forbidden", 403
-    with db._conn() as conn:
+    with db._session() as conn:
         openids = [r["openid"] for r in
                    conn.execute("SELECT DISTINCT openid FROM records")]
     results = {}
@@ -965,7 +965,7 @@ def push_annual_endpoint():
             year = int(request.args.get("year"))
         except ValueError:
             return "bad year", 400
-    with db._conn() as conn:
+    with db._session() as conn:
         openids = [r["openid"] for r in
                    conn.execute("SELECT DISTINCT openid FROM records")]
     results = {}

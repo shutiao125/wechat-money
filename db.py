@@ -18,26 +18,29 @@ def _conn() -> sqlite3.Connection:
 
 @contextmanager
 def _session():
-    """连接会话: 正常结束提交, 异常回滚, 无论成败都关闭连接
-    (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)"""
-    conn = _conn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    """连接会话: 进程内串行 + 正常结束提交, 异常回滚, 无论成败都关闭连接
+    (注意: sqlite3 close() 会回滚未提交事务, 不能只 close 不 commit)
+    网络盘上并发访问SQLite极易卡死, 这里用一把锁把所有读写串行化"""
+    with _lock:
+        conn = _conn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def init_db():
     with _session() as conn:
-        # WAL: 读写并发不互斥, 大幅避免 database is locked
-        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        # 不要用WAL: 部署环境(如PythonAnywhere)的home是网络盘, WAL依赖-shm共享内存,
+        # 在这种盘上会退化为极慢甚至直接卡死(请求卡到被uWSGI harakiri杀掉, 不报错)。
+        # 改用默认的 rollback journal(DELETE), 配合上面_session的进程内串行锁避免冲突
+        mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         conn.execute("PRAGMA busy_timeout=3000")
-        # 启动打点: 真实库路径 + 实际生效的日志模式(WAL在部分网络盘上会退化为delete,
-        # 那就会读写互斥 -> 查询卡住 -> 微信5秒超时无回复, 这里能一眼看出)
+        # 启动打点: 真实库路径 + 实际生效的日志模式(应为delete)
         print(f"[db] DB_PATH={DB_PATH} journal_mode={mode}")
         conn.execute("""CREATE TABLE IF NOT EXISTS records(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +65,7 @@ def init_db():
 def add_record(openid: str, tx_date: str, rtype: str, category: str,
                amount: float, note: str = "", source: str = "text",
                subcategory: str = "", subcat_src: str = ""):
-    with _lock, _session() as conn:
+    with _session() as conn:
         conn.execute(
             "INSERT INTO records(openid,tx_date,type,category,subcategory,"
             "subcat_src,amount,note,source) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -167,7 +170,7 @@ def delete_record_by_match(openid: str, tx_date: str, kind: str, amount,
     """按日期+分类(或细分类)+金额删除一条账目; amount 为 None 时不限金额
     note 非空时再按备注精确匹配
     多个匹配时删除最早的一笔; 返回(被删记录dict, 剩余相同记录数); 无匹配返回(None, 0)"""
-    with _lock, _session() as conn:
+    with _session() as conn:
         where = "openid=? AND tx_date=? AND (category=? OR subcategory=?)"
         args = [openid, tx_date, kind, kind]
         if amount is not None:
@@ -206,6 +209,6 @@ def unclassified_records(limit: int = 500) -> list:
 
 def update_record_subcategory(rid: int, subcategory: str, src: str = ""):
     """按记录id回填/修正大类, 同时记录来源(local/ai)"""
-    with _lock, _session() as conn:
+    with _session() as conn:
         conn.execute("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
                      (subcategory, src, rid))
