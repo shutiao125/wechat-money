@@ -1,5 +1,6 @@
 ledger.db
 .app_pid
+.local_ssh/
 __pycache__/
 *.pyc
 .env
