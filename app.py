@@ -852,28 +852,38 @@ def wechat_callback():
             return wechat.to_text_reply(
                 msg.get("ToUserName", ""), openid,
                 "❌ 没有可补记的条目\n示例: 批量补记 10-19 吹头发0.87；10-20 吹头发0.75")
-        ok, fail, total = [], [], 0.0
+        ok, fail, total, total_n = [], [], 0.0, 0
         for seg in segs[:30]:
             day, body = _parse_day_prefix(seg)
             if not day or not body:
                 fail.append(seg)
                 continue
-            r = parse_record(body)
-            amt = float(r.get("amount") or 0)
-            if amt <= 0:
+            items = tokenize_amounts(body)       # 一段内可含多笔: "午餐11.3 咖啡5.9"
+            if not items:
                 fail.append(seg)
                 continue
-            handle_record(openid, body, source, day)
-            total += amt
-            ok.append(f"{day[5:]} {r['category']} ¥{amt:g}")
+            day_sum, day_n = 0.0, 0
+            for name, amt in items[:20]:
+                amt = float(amt)
+                if amt <= 0:
+                    continue
+                handle_record(openid, f"{name} {amt:g}", source, day)
+                total += amt
+                day_sum += amt
+                day_n += 1
+            if day_n == 0:
+                fail.append(seg)
+                continue
+            total_n += day_n
+            ok.append(f"{day[5:]} {day_n}笔 ¥{day_sum:.2f}")
         if not ok:
             return wechat.to_text_reply(
                 msg.get("ToUserName", ""), openid,
                 "❌ 没有成功补记的条目, 请检查格式\n"
-                "示例: 批量补记 10-19 吹头发0.87；10-20 吹头发0.75")
-        reply = f"✅ 已批量补记 {len(ok)} 笔, 合计 ¥{total:.2f}\n" + "\n".join(ok[:15])
+                "示例: 批量补记 10-19 吹头发0.87；10-20 剪发0.75")
+        reply = f"✅ 已批量补记 {total_n} 笔, 合计 ¥{total:.2f}\n" + "\n".join(ok[:15])
         if len(ok) > 15:
-            reply += f"\n...另有{len(ok)-15}笔已入账"
+            reply += f"\n...另有{len(ok)-15}个日期已入账"
         if fail:
             reply += "\n⚠️ 未识别:\n" + "\n".join(fail[:3])
             if len(fail) > 3:
