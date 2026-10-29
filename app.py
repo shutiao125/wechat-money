@@ -184,6 +184,8 @@ HELP = ("📌 记账详细命令:\n"
         "    「午饭35」「打车花20」「发工资12000」\n"
         "    「昨天买书58」「补记2026年9月5日吃饭30」\n"
         "    「奶茶6 洗澡2 喝水3」——一次记多笔\n"
+        "  批量补记(补多天, 用；或换行分隔):\n"
+        "    批量补记 10-19 吹头发0.87；10-20 吹头发0.75\n"
         "  不用记命令也行, AI能听懂, 例如:\n"
         "    「帮我把昨天的奶茶删掉」「上周花了多少」\n"
         "🔎 查账:\n"
@@ -238,6 +240,37 @@ def _compact_ymd(digits: str):
         m, d = int(rest[0]), int(rest[1])
     datetime(y, m, d)                       # 校验日期合法性(如2月30日会抛错)
     return y, m, d
+
+
+def _parse_day_prefix(seg: str):
+    """从一段文本开头解析日期, 返回(YYYY-MM-DD, 剩余内容); 解析失败返回(None, "")"""
+    s = seg.strip()
+    m = re.match(r"^(?:(\d{4})年)?(\d{1,2})月(\d{1,2})[日号]\s*", s)
+    if m:
+        year = int(m.group(1)) if m.group(1) else now().year
+        try:
+            day = f"{year}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            datetime.strptime(day, "%Y-%m-%d")
+            return day, s[m.end():].strip()
+        except ValueError:
+            return None, ""
+    m = re.match(r"^(?:(\d{4})[-/])?(\d{1,2})[-/](\d{1,2})\s*", s)
+    if m:
+        year = int(m.group(1)) if m.group(1) else now().year
+        try:
+            day = f"{year}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            datetime.strptime(day, "%Y-%m-%d")
+            return day, s[m.end():].strip()
+        except ValueError:
+            return None, ""
+    m = re.match(r"^(\d{7,8})\s*", s)
+    if m:
+        try:
+            y, mo, d = _compact_ymd(m.group(1))
+            return f"{y}-{mo:02d}-{d:02d}", s[m.end():].strip()
+        except ValueError:
+            return None, ""
+    return None, ""
 
 
 def _strip_date(s: str):
@@ -802,6 +835,50 @@ def wechat_callback():
             f"📅 {day} 共{len(rows)}笔, 合计 ¥{total:.2f}:\n"
             + "\n".join(lines)
             + f"\n(删除某条: 删除{day} 分类 金额)")
+    # 批量补记: 一条消息补多天/多笔
+    #   批量补记 10-19 吹头发0.87；10-20 吹头发0.75
+    #   也支持换行分隔(每行"日期 类别金额")，最多一次30笔
+    m_bb = re.match(r"^(?:批量补记|批量记账)\s*[:：]?\s*(.+)$", text, re.S)
+    if not m_bb:
+        m_multi = re.match(r"^补记\s*[:：]?\s*(.+)$", text, re.S)
+        if m_multi and re.search(r"[；;\n]", m_multi.group(1)):
+            m_bb = m_multi
+    if m_bb:
+        payload = m_bb.group(1).strip()
+        segs = [x.strip() for x in re.split(
+            r"[；;\n]+|，(?=\s*(?:\d{1,2}月|\d{1,2}[-/]|\d{4}年|\d{7,8}\s))",
+            payload) if x.strip()]
+        if not segs:
+            return wechat.to_text_reply(
+                msg.get("ToUserName", ""), openid,
+                "❌ 没有可补记的条目\n示例: 批量补记 10-19 吹头发0.87；10-20 吹头发0.75")
+        ok, fail, total = [], [], 0.0
+        for seg in segs[:30]:
+            day, body = _parse_day_prefix(seg)
+            if not day or not body:
+                fail.append(seg)
+                continue
+            r = parse_record(body)
+            amt = float(r.get("amount") or 0)
+            if amt <= 0:
+                fail.append(seg)
+                continue
+            handle_record(openid, body, source, day)
+            total += amt
+            ok.append(f"{day[5:]} {r['category']} ¥{amt:g}")
+        if not ok:
+            return wechat.to_text_reply(
+                msg.get("ToUserName", ""), openid,
+                "❌ 没有成功补记的条目, 请检查格式\n"
+                "示例: 批量补记 10-19 吹头发0.87；10-20 吹头发0.75")
+        reply = f"✅ 已批量补记 {len(ok)} 笔, 合计 ¥{total:.2f}\n" + "\n".join(ok[:15])
+        if len(ok) > 15:
+            reply += f"\n...另有{len(ok)-15}笔已入账"
+        if fail:
+            reply += "\n⚠️ 未识别:\n" + "\n".join(fail[:3])
+            if len(fail) > 3:
+                reply += f"\n...另有{len(fail)-3}条格式不对"
+        return wechat.to_text_reply(msg.get("ToUserName", ""), openid, reply)
     # 补记某天的账: 补记9月5日午饭30块(默认今年) / 补记2025年12月24日买礼物88元
     m_bu = re.match(r"^补记\s*(?:(\d{4})年)?\s*(\d{1,2})月(\d{1,2})[日号]\s*(.+)$", text) or \
            re.match(r"^补记\s*(?:(\d{4})-)?(\d{1,2})-(\d{1,2})\s+(.+)$", text)
