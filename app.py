@@ -190,6 +190,7 @@ HELP = ("📌 记账详细命令:\n"
         "  最近——查看最近5条记录\n"
         "  本月——查看本月记录情况\n"
         "  今日——查看今天记录情况\n"
+        "  诊断——检查数据是否完整\n"
         "  也可指定查询某天，如:\n"
         "  查2026年9月5日(查20260905)\n"
         "🗑️ 删账:\n"
@@ -740,6 +741,20 @@ def wechat_callback():
         return wechat.to_text_reply(
             msg.get("ToUserName", ""), openid,
             "📋 最近5笔:\n" + "\n".join(lines))
+    if text in ("诊断", "自检"):
+        d = db.diagnose(openid)
+        disk = d["disk"]
+        lines = [
+            f"🔧 进程PID: {d['pid']}",
+            f"📚 内存库: {d['total']}笔 ({d['first']}~{d['last']}) max_id={d['mem_max_id']}",
+            f"💾 磁盘库: {disk['records']}笔 max_id={disk['max_id']} "
+            f"{'存在' if disk['exists'] else '不存在'} {disk['mtime']}",
+            "近7天: " + ("、".join(f"{day[5:]}×{n}" for day, n in d["daily"]) or "无"),
+        ]
+        if disk["max_id"] > d["mem_max_id"]:
+            lines.append("⚠️ 磁盘库比当前进程新, 说明有另一个进程也在写这个库")
+        return wechat.to_text_reply(msg.get("ToUserName", ""), openid,
+                                    "\n".join(lines))
     # 周报: 仅每周日可查询
     if text in ("周报", "本周"):
         if now().weekday() != 6:     # weekday(): 周一=0 ... 周日=6

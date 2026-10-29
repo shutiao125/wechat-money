@@ -29,6 +29,8 @@ _mem_conn = None            # 主连接(进程内由 _lock 串行)
 _init_lock = threading.Lock()
 _backup_thread = None
 _stop_backup = False
+_dirty = threading.Event()  # 有写入待落盘: 后台线程立即备份, 而非等满30秒
+_pid_file = None            # 进程标识文件: 用于发现多worker各持一份内存库
 
 
 def _caller() -> str:
@@ -100,7 +102,55 @@ def _load_disk_into(conn):
             src.backup(conn)
         finally:
             src.close()
-        print(f"[db] 已从磁盘加载 {DB_PATH}", flush=True)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            rng = conn.execute("SELECT MIN(tx_date), MAX(tx_date) FROM records").fetchone()
+            print(f"[db] 已从磁盘加载 {DB_PATH}: {n}条 日期{rng[0]}~{rng[1]}", flush=True)
+        except Exception:
+            print(f"[db] 已从磁盘加载 {DB_PATH}", flush=True)
+    else:
+        print(f"[db] 磁盘库不存在({DB_PATH}), 从空库开始", flush=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _mark_pid():
+    """记录当前进程号; 发现别的进程也在用同一库时告警(多worker会各持一份内存库)"""
+    global _pid_file
+    try:
+        _pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".app_pid")
+        old = ""
+        if os.path.exists(_pid_file):
+            old = open(_pid_file, "r").read().strip()
+        if old.isdigit() and int(old) != os.getpid() and _pid_alive(int(old)):
+            print(f"[db] ⚠️ 检测到另一进程 pid={old} 也使用该库(当前pid={os.getpid()}), "
+                  f"多worker会导致内存库数据不一致", flush=True)
+        with open(_pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def _disk_max_id() -> int:
+    """磁盘库当前最大记录id; 库不存在/无表返回0"""
+    if not os.path.exists(DB_PATH):
+        return 0
+    try:
+        c = sqlite3.connect(DB_PATH)
+        try:
+            row = c.execute("SELECT COALESCE(MAX(id),0) FROM records").fetchone()
+            return int(row[0] or 0)
+        finally:
+            c.close()
+    except Exception:
+        return 0
+
 
 
 def _init_schema(conn):
@@ -142,6 +192,7 @@ def init_db():
         _load_disk_into(conn)
         _init_schema(conn)
         _mem_conn = conn
+        _mark_pid()
         print(f"[db] 内存库就绪(备份间隔{DB_BACKUP_INTERVAL}s -> {DB_PATH})", flush=True)
 
 
@@ -160,18 +211,35 @@ def _ensure_backup():
 
 
 def _backup_loop():
+    """有写入就尽快备份(写后约1秒), 无写入时也按间隔兜底一次"""
     while not _stop_backup:
-        time.sleep(DB_BACKUP_INTERVAL)
+        signalled = _dirty.wait(timeout=DB_BACKUP_INTERVAL)
+        if _stop_backup:
+            return
+        if not signalled:
+            continue                      # 期间没有写入, 不必空转写盘
+        _dirty.clear()
+        time.sleep(1.0)                   # 合并同一波连续写入, 只备份一次
         try:
             _backup_once()
         except Exception as e:
+            _dirty.set()                  # 备份失败: 下一轮重试
             print(f"[db] ⚠️ 后台备份失败(下次重试): {e}", flush=True)
 
 
 def _backup_once():
     """在线备份: 独立连接打开共享缓存内存库 -> 备份到磁盘文件。
-    备份期间主连接读写不阻塞(backup只短暂持有源库读锁, 页写入慢在磁盘侧)"""
+    备份期间主连接读写不阻塞(backup只短暂持有源库读锁, 页写入慢在磁盘侧)
+    保护: 磁盘库的最大id比内存库还新, 说明有另一个进程在写同一文件,
+    此时绝不覆盖磁盘(否则会用本进程的旧快照冲掉别人的新数据)"""
     if _mem_conn is None:
+        return
+    mem_max = int(_mem_conn.execute(
+        "SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0])
+    disk_max = _disk_max_id()
+    if disk_max > mem_max:
+        print(f"[db] ⚠️ 磁盘库比内存库新(磁盘max_id={disk_max}, 内存max_id={mem_max}), "
+              f"跳过备份以免覆盖其他进程的数据", flush=True)
         return
     t0 = time.monotonic()
     src = sqlite3.connect(_MEM_URI, uri=True)
@@ -193,9 +261,12 @@ def _session(wait: bool = True):
     with _lock.hold(2.0, wait=wait):
         t0 = time.monotonic()
         conn = _mem_conn
+        before = conn.total_changes
         try:
             yield conn
             conn.commit()
+            if conn.total_changes != before:
+                _dirty.set()           # 有写入 -> 通知后台尽快落盘
         except Exception:
             conn.rollback()
             raise
@@ -398,3 +469,44 @@ def update_subcategories_bulk(updates: list):
     with _session() as conn:
         conn.executemany("UPDATE records SET subcategory=?, subcat_src=? WHERE id=?",
                          [(sub, src, rid) for rid, sub, src in updates])
+
+
+def diagnose(openid: str, days: int = 7) -> dict:
+    """自检: 返回当前进程所用库的真实数据概况, 用于排查"记了却查不到"。
+    对比内存库与磁盘库的记录数/最大id, 可直接看出两份数据是否一致"""
+    import datetime as _dt
+    today = _dt.date.today()
+    start = (today - _dt.timedelta(days=days - 1)).isoformat()
+    with _session() as conn:
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM records WHERE openid=?", (openid,)).fetchone()[0])
+        rng = conn.execute(
+            "SELECT MIN(tx_date), MAX(tx_date) FROM records WHERE openid=?",
+            (openid,)).fetchone()
+        mem_max = int(conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0])
+        daily = conn.execute(
+            "SELECT tx_date, COUNT(*) FROM records "
+            "WHERE openid=? AND tx_date>=? GROUP BY tx_date ORDER BY tx_date",
+            (openid, start)).fetchall()
+    disk_info = {"exists": os.path.exists(DB_PATH), "size": 0,
+                 "mtime": "", "records": 0, "max_id": 0}
+    if disk_info["exists"]:
+        try:
+            import time as _t
+            disk_info["size"] = os.path.getsize(DB_PATH)
+            disk_info["mtime"] = _t.strftime(
+                "%Y-%m-%d %H:%M:%S", _t.localtime(os.path.getmtime(DB_PATH)))
+            c = sqlite3.connect(DB_PATH)
+            try:
+                disk_info["records"] = int(c.execute(
+                    "SELECT COUNT(*) FROM records").fetchone()[0])
+                disk_info["max_id"] = int(c.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM records").fetchone()[0])
+            finally:
+                c.close()
+        except Exception as e:
+            disk_info["error"] = str(e)
+    return {"pid": os.getpid(), "db_path": DB_PATH, "total": total,
+            "first": rng[0], "last": rng[1], "mem_max_id": mem_max,
+            "disk": disk_info, "daily": [(r[0], r[1]) for r in daily]}
