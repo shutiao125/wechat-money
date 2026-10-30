@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""微信测试号接口封装: 签名校验 / XML解析 / 被动回复 / 客服消息 / 模板消息 / 素材下载"""
+"""微信公众号接口封装: 签名校验 / XML解析 / 被动回复 / 客服消息 / 模板消息 / 素材下载"""
 import time
 import json
 import hashlib
@@ -21,7 +21,7 @@ def _post_json(url: str, params: dict, payload: dict):
                          headers={"Content-Type": "application/json"}, timeout=10)
 
 
-# ---------- 回调签名校验 (测试号接口配置的GET验证) ----------
+# ---------- 回调签名校验 (公众号服务器配置的GET验证) ----------
 def check_signature(token: str, signature: str, timestamp: str, nonce: str) -> bool:
     tmp = "".join(sorted([token, timestamp, nonce]))
     return hashlib.sha1(tmp.encode()).hexdigest() == signature

@@ -1,5 +1,5 @@
-"""微信测试号回调服务入口: 消息回调 + 记账
-运行: python app.py  (开发时配合内网穿透暴露公网HTTPS)
+"""微信公众号回调服务入口: 消息回调 + 记账
+运行: python app.py  (需公网HTTPS地址, 在公众号后台配置服务器URL)
 """
 import re
 import time
@@ -642,7 +642,7 @@ def handle_record(openid: str, text: str, source: str, day: str = "") -> str:
 @app.route("/wechat", methods=["GET", "POST"])
 def wechat_callback():
     if request.method == "GET":
-        # 测试号接口配置的URL验证
+        # 公众号服务器配置的URL验证
         if wechat.check_signature(WECHAT_TOKEN, request.args.get("signature", ""),
                                   request.args.get("timestamp", ""),
                                   request.args.get("nonce", "")):
@@ -1200,7 +1200,7 @@ def _start_scheduler():
 
 if __name__ == "__main__":
     print(f"[config] 本次启动使用的Token: {WECHAT_TOKEN!r}  "
-          f"(测试号页面填的Token必须与之一致)")
+          f"(公众号后台服务器配置的Token必须与之一致)")
     if RUN_SCHEDULER:
         _start_scheduler()
     app.run(host="0.0.0.0", port=8000)

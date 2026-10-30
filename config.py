@@ -39,17 +39,17 @@ def now() -> _datetime:
             pass
     return _datetime.now()
 
-# ---------- 微信测试号配置 (申请地址: https://mp.weixin.qq.com/debug/cgi-bin/sandbox) ----------
-WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")          # 敏感: 接口配置里的Token, 用环境变量设置
-WECHAT_APPID = os.getenv("WECHAT_APPID", "wx2bc8c88a76b0cf50")               # 测试号信息的appID
-WECHAT_SECRET = os.getenv("WECHAT_SECRET", "")        # 敏感: 测试号appsecret, 用环境变量设置
+# ---------- 微信公众号配置 (后台: 设置与开发 → 基本配置) ----------
+WECHAT_TOKEN = os.getenv("WECHAT_TOKEN", "")          # 敏感: 服务器配置里的Token, 用环境变量设置
+WECHAT_APPID = os.getenv("WECHAT_APPID", "wx2bc8c88a76b0cf50")               # 公众号的appID
+WECHAT_SECRET = os.getenv("WECHAT_SECRET", "")        # 敏感: 公众号appsecret, 用环境变量设置
 
-# 每日推送用的测试号模板消息ID (测试号页面"模板消息接口"->新增测试模板后获得)
+# 每日推送用的模板消息ID (公众号后台"模板消息"->选用模板后获得; 需已认证服务号)
 # 模板内容建议: 支出:{{expense.DATA}}  收入:{{income.DATA}}  {{remark.DATA}}
 # 留空则退化为客服文本消息推送
 DAILY_TEMPLATE_ID = os.getenv("DAILY_TEMPLATE_ID", "ifAqL7SDeoE8NIxKr4I9WZqMXrawdSHvJghNZbovito")
 
-# 允许使用的openid白名单, 逗号分隔; 留空=不限制(测试号本来就只有你自己)
+# 允许使用的openid白名单, 逗号分隔; 留空=不限制(公众号下建议配置, 避免陌生人记账)
 ALLOWED_OPENIDS = set(filter(None, os.getenv("ALLOWED_OPENIDS", "").split(",")))
 
 # ---------- 大模型配置 (任意OpenAI兼容接口: 智谱/DeepSeek/通义/Kimi/SiliconFlow等) ----------

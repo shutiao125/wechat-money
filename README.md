@@ -53,8 +53,9 @@ cp .env.example .env
 
 | 变量 | 说明 |
 |---|---|
-| `WECHAT_TOKEN` | 微信测试号「接口配置信息」里的 Token |
-| `WECHAT_SECRET` | 微信测试号 appsecret |
+| `WECHAT_TOKEN` | 公众号「设置与开发 → 基本配置 → 服务器配置」里的 Token |
+| `WECHAT_APPID` / `WECHAT_SECRET` | 公众号基本配置里的 AppID / AppSecret |
+| `DAILY_TEMPLATE_ID` | 每日推送用的模板 ID，留空则退化为客服文本消息 |
 | `PUSH_TOKEN` | 手动触发推送接口的口令 |
 | `CF_ACCOUNT_ID` / `CF_API_TOKEN` / `CF_MODEL` | Cloudflare Workers AI 凭据与模型，用于 AI 分析；不配置则降级为本地文字分析 |
 | `RUN_SCHEDULER` / `PUSH_HOUR` / `PUSH_MINUTE` | 内置定时推送开关与时间（默认每天 21:30） |
@@ -66,11 +67,17 @@ cp .env.example .env
 python app.py
 ```
 
-### 5. 微信测试号配置
+### 5. 微信公众号配置
 
-1. 申请微信测试号：<https://mp.weixin.qq.com/debug/cgi-bin/sandbox>
-2. 在「接口配置信息」中填写服务器地址：`https://你的域名/wechat`，Token 与 `WECHAT_TOKEN` 保持一致
-3. 关注测试号后，在聊天窗口发送消息即可开始记账
+1. 登录微信公众平台 <https://mp.weixin.qq.com>，进入「设置与开发 → 基本配置」
+2. 在「服务器配置」中填写：
+   - URL：`https://你的域名/wechat`
+   - Token：与 `.env` 中 `WECHAT_TOKEN` 完全一致
+   - 消息加解密方式：明文模式（如使用安全模式，还需配置 `EncodingAESKey`）
+3. 提交并启用配置（服务器需先在 80/443 端口可访问，微信会发起 GET 校验）
+4. 用户关注公众号后，在聊天窗口发送消息即可开始记账
+
+> 每日定时推送使用模板消息，需要**已认证服务号**并开通模板消息权限；订阅号无此权限时请将 `DAILY_TEMPLATE_ID` 留空或关闭 `RUN_SCHEDULER`，推送会退化为客服文本消息。
 
 ## 部署到 PythonAnywhere
 
@@ -87,7 +94,7 @@ db.py           # SQLite 数据层: 记录增删改查与统计
 llm_parser.py   # 记账文本解析 + Cloudflare Workers AI 调用封装
 report.py       # 日报 / 周报 / 年报统计与推送
 daily_push.py   # 定时推送脚本（供 cron / 计划任务调用）
-wechat.py       # 微信测试号接口封装（签名校验、收发消息）
+wechat.py       # 微信公众号接口封装（签名校验、收发消息）
 config.py       # 全局配置（支持 .env 与环境变量覆盖）
 ```
 
